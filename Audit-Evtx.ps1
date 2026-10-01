@@ -28,6 +28,8 @@ param(
     [switch]$SkipCorrelation,
     [switch]$SkipTriage,
     [ValidateRange(1,1440)][int]$TriageWindowMinutes = 30,
+    [ValidateRange(1,720)][int]$IncidentGapHours = 24,
+    [string]$DisplayTimeZone,
     [switch]$NoExcel,
     [switch]$KeepTechnicalFiles,
     [switch]$IncludeAllAntivirusEvents,
@@ -36,9 +38,12 @@ param(
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$script:Version = '9.1.0'
+$script:Version = '9.2.0'
 $script:Utf8 = New-Object System.Text.UTF8Encoding($true)
 $script:Invariant = [Globalization.CultureInfo]::InvariantCulture
+# Time zone for the "(местное)" columns: -DisplayTimeZone (Windows id, e.g. 'Russian Standard Time') or this computer's zone.
+$script:DisplayTz=[TimeZoneInfo]::Local
+if ($DisplayTimeZone) { $script:DisplayTz=[TimeZoneInfo]::FindSystemTimeZoneById($DisplayTimeZone) }
 $script:FastCellInvalid=New-Object Text.RegularExpressions.Regex('[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]')
 $script:FastCellFormula=New-Object Text.RegularExpressions.Regex('^\s*[=+@-]')
 $script:CellReplacement=[Text.RegularExpressions.MatchEvaluator]{param($m) return ('[U+{0:X4}]' -f [int][char]$m.Value[0])}
@@ -178,6 +183,10 @@ Microsoft-Windows-TaskScheduler	141	Закрепление / запуск	Medium
 $script:NoiseRules = [System.Collections.Generic.HashSet[string]]::new([string[]]@(
     'Microsoft-Windows-Security-Auditing|4670',  # object permissions: very noisy with Object Access audit
     'Microsoft-Windows-Security-Auditing|4700',
+    'Microsoft-Windows-Security-Auditing|4723',  # user changes own password
+    'Microsoft-Windows-Security-Auditing|4946',  # firewall rules: mass-created by app installs/updates
+    'Microsoft-Windows-Security-Auditing|4947',
+    'Microsoft-Windows-Security-Auditing|4948',
     'Microsoft-Windows-Security-Auditing|4701',
     'Microsoft-Windows-Security-Auditing|4705',
     'Microsoft-Windows-Security-Auditing|4718',
@@ -550,6 +559,8 @@ function Match-Event($e, [bool]$VendorFile) {
             if (-not $IncludeNoise) { return }
             $r.Severity = 'Info'; $r.Note += ' Встроенная служебная учетная запись.'
         }
+        # Computer accounts (NAME$) and Window Manager / font driver sessions (S-1-5-90-*, S-1-5-96-*) are not people.
+        if ($r -and $e.Id -in @(4672,4648) -and -not $IncludeNoise -and ((Field $d @('SubjectUserName')).EndsWith('$') -or (Field $d @('SubjectUserSid')) -match '^S-1-5-(90|96)-')) { return }
         if ($e.Id -in @(4728,4732,4756)) {
             $sid = Field $d @('TargetSid')
             if ($sid -match '^S-1-5-32-(544|548|549|550|551)$|^S-1-5-21-\d+-\d+-\d+-(512|518|519)$') {
@@ -1063,31 +1074,82 @@ function New-RunSummaryCsv([string]$WorkPath) {
     } finally { Close-Writer $w }
     return $path
 }
-function Export-ReportsToExcel([string]$WorkPath,[string]$XlsxPath) {
-    $reports=New-Object 'System.Collections.Generic.List[object]'
-    $triagePath=Join-Path $WorkPath 'Triage.csv'
-    if (Test-Path -LiteralPath $triagePath) { $reports.Add([pscustomobject]@{Name='Приоритетные';Path=$triagePath}) }
+# Excel layout: sheet order, numeric columns, widths, wrapping, hidden technical
+# columns and priority colors. Kept separate from COM so SelfTest can check it.
+$script:NumericHeaders=[Collections.Generic.HashSet[string]]::new([string[]]@('Оценка риска','Связанных уникальных событий','Сценариев','Количество','Событий в окне','Разных УЗ',
+    'Сеансов (пар)','Суммарная длительность, сек','Длительность, сек','Номер','Находок','Прочитано подходящих событий','Ошибок разбора','Нет описания Windows','Размер, байт','Время обработки, сек'))
+$script:WideHeaders=[Collections.Generic.HashSet[string]]::new([string[]]@('Хронология','Основание связи','Почему выделено','Что проверить','УЗ / объект / IP','Ссылки на находки и EVTX (до 10)',
+    'Комментарий','Что это означает / что запросить','Что делать','Ограничения','Ошибка','Этапы (тактики)','Данные события','Описание Windows','Командная строка'))
+$script:MediumHeaders=[Collections.Generic.HashSet[string]]::new([string[]]@('Сценарий','Тактика','MITRE ATT&CK','Учетные записи','IP источника','IP источников','Компьютер','Событие','Категория',
+    'Цепочка атаки','Инициатор','Целевая УЗ','Учетная запись','Файл источника','Папка источника','Полный путь','Процесс','Имя угрозы','Ресурс / путь'))
+$script:HiddenFindingHeaders=[Collections.Generic.HashSet[string]]::new([string[]]@('Папка источника','Полный путь','Канал','Уровень Windows','Статус описания','SHA256 XML события','Восстановление XML','Правило'))
+function Read-CsvHeader([string]$Path) {
+    $reader=New-Object IO.StreamReader($Path,[Text.Encoding]::UTF8,$true)
+    try { $line=$reader.ReadLine() } finally { $reader.Dispose() }
+    if (-not $line) { return @() }
+    $quote='"'
+    return @($line.Trim().Trim($quote) -split [regex]::Escape($quote+[string]$Delimiter+$quote))
+}
+function Get-ExcelSheetPlan([string]$WorkPath) {
+    $plan=New-Object 'System.Collections.Generic.List[object]'
+    $add={ param([string]$Name,[string]$Path,[string]$Kind)
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+        $headers=Read-CsvHeader $Path
+        $types=New-Object 'System.Collections.Generic.List[int]'; $widths=New-Object 'System.Collections.Generic.List[double]'
+        $wrap=New-Object 'System.Collections.Generic.List[int]'; $hidden=New-Object 'System.Collections.Generic.List[int]'
+        $priority=0
+        for ($c=0; $c -lt $headers.Count; $c++) {
+            $h=$headers[$c]
+            if ($script:NumericHeaders.Contains($h)) { $types.Add(1) } else { $types.Add(2) }
+            if ($script:WideHeaders.Contains($h)) { $widths.Add(60); $wrap.Add($c+1) } elseif ($script:MediumHeaders.Contains($h)) { $widths.Add(30) } else { $widths.Add(0) }
+            if ($Kind -eq 'Findings' -and ($script:HiddenFindingHeaders.Contains($h) -or ($h -eq 'Описание Windows' -and -not $script:FormatMessages))) { $hidden.Add($c+1) }
+            if ($h -eq 'Приоритет' -and $priority -eq 0) { $priority=$c+1 }
+        }
+        $plan.Add([pscustomobject]@{Name=$Name;Path=$Path;Kind=$Kind;Headers=$headers;Types=$types.ToArray();Widths=$widths.ToArray();Wrap=$wrap.ToArray();Hidden=$hidden.ToArray();PriorityColumn=$priority})
+    }
+    & $add 'Инциденты' (Join-Path $WorkPath 'Incidents.csv') 'Priority'
+    & $add 'Приоритетные' (Join-Path $WorkPath 'Triage.csv') 'Priority'
+    & $add 'Подбор_пароля' (Join-Path $WorkPath 'AuthBursts.csv') 'Severity'
+    & $add 'RDP_итоги' (Join-Path $WorkPath 'RdpTotals.csv') 'Plain'
+    & $add 'RDP_сеансы' (Join-Path $WorkPath 'RdpIntervals.csv') 'Plain'
     $parts=@(Get-ChildItem -LiteralPath $WorkPath -Filter 'Findings-*.csv' -File | Sort-Object Name)
     for ($i=0; $i -lt $parts.Count; $i++) {
-        $name='Находки'
-        if ($parts.Count -gt 1) { $name='Находки_'+($i+1) }
-        $reports.Add([pscustomobject]@{Name=$name;Path=$parts[$i].FullName})
+        $name='Находки'; if ($parts.Count -gt 1) { $name='Находки_'+($i+1) }
+        & $add $name $parts[$i].FullName 'Findings'
     }
-    $extraReports=@(
-        [pscustomobject]@{Name='Сводка';File='Summary.csv'},
-        [pscustomobject]@{Name='Подбор_пароля';File='AuthBursts.csv'},
-        [pscustomobject]@{Name='RDP_сеансы';File='RdpIntervals.csv'},
-        [pscustomobject]@{Name='RDP_итоги';File='RdpTotals.csv'},
-        [pscustomobject]@{Name='Файлы';File='Files.csv'},
-        [pscustomobject]@{Name='Качество_выгрузки';File='Coverage.csv'},
-        [pscustomobject]@{Name='Ошибки';File='Errors.csv'}
-    )
-    foreach ($item in $extraReports) {
-        $path=Join-Path $WorkPath $item.File
-        if (Test-Path -LiteralPath $path) { $reports.Add([pscustomobject]@{Name=$item.Name;Path=$path}) }
-    }
+    & $add 'Сводка' (Join-Path $WorkPath 'Summary.csv') 'Severity'
+    & $add 'Файлы' (Join-Path $WorkPath 'Files.csv') 'Plain'
+    & $add 'Качество_выгрузки' (Join-Path $WorkPath 'Coverage.csv') 'Plain'
+    & $add 'Ошибки' (Join-Path $WorkPath 'Errors.csv') 'Plain'
     $runSummary=New-RunSummaryCsv $WorkPath
-    if ($runSummary) { $reports.Add([pscustomobject]@{Name='Запуск';Path=$runSummary}) }
+    if ($runSummary) { & $add 'Запуск' $runSummary 'Plain' }
+    return ,$plan
+}
+function Get-ColumnLetter([int]$Index) {
+    $letters=''
+    while ($Index -gt 0) { $m=($Index-1)%26; $letters=[char](65+$m)+$letters; $Index=[int][Math]::Floor(($Index-1)/26) }
+    return $letters
+}
+function Add-ExcelPriorityColors($Sheet,$Item,[int]$Rows,[int]$Columns) {
+    # Excel colors are BGR integers. Light red / light amber fills, dark text.
+    $missing=[Reflection.Missing]::Value
+    $col=Get-ColumnLetter $Item.PriorityColumn
+    if ($Item.Kind -eq 'Priority') {
+        $range=$Sheet.Range(('A2:'+(Get-ColumnLetter $Columns)+$Rows))
+        foreach ($rule in @(@($script:P1,13551615,393372),@($script:P2,10284031,26012))) {
+            $fc=$range.FormatConditions.Add(2,$missing,('=$'+$col+'2="'+$rule[0]+'"'))
+            $fc.Interior.Color=$rule[1]; $fc.Font.Color=$rule[2]
+        }
+    } else {
+        $range=$Sheet.Range(($col+'2:'+$col+$Rows))
+        foreach ($rule in @(@((Ru-Severity 'High'),13551615,393372),@((Ru-Severity 'Medium'),10284031,26012))) {
+            $fc=$range.FormatConditions.Add(1,3,('="'+$rule[0]+'"'))
+            $fc.Interior.Color=$rule[1]; $fc.Font.Color=$rule[2]
+        }
+    }
+}
+function Export-ReportsToExcel([string]$WorkPath,[string]$XlsxPath) {
+    $reports=Get-ExcelSheetPlan $WorkPath
     if ($reports.Count -eq 0) { throw 'Нет CSV-отчетов для упаковки в Excel.' }
 
     $excel=$null; $book=$null
@@ -1103,12 +1165,13 @@ function Export-ReportsToExcel([string]$WorkPath,[string]$XlsxPath) {
         while ($book.Worksheets.Count -lt $reports.Count) { [void]$book.Worksheets.Add() }
         while ($book.Worksheets.Count -gt $reports.Count) { $book.Worksheets.Item($book.Worksheets.Count).Delete() }
         for ($i=0; $i -lt $reports.Count; $i++) {
+            $item=$reports[$i]
             $sheet=$null; $cell=$null; $qt=$null; $used=$null
             try {
                 $sheet=$book.Worksheets.Item($i+1)
-                $sheet.Name=[string]$reports[$i].Name
+                $sheet.Name=[string]$item.Name
                 $cell=$sheet.Range('A1')
-                $qt=$sheet.QueryTables.Add(('TEXT;'+[string]$reports[$i].Path),$cell)
+                $qt=$sheet.QueryTables.Add(('TEXT;'+[string]$item.Path),$cell)
                 $qt.BackgroundQuery=$false
                 $qt.TextFilePromptOnRefresh=$false
                 $qt.TextFilePlatform=65001
@@ -1121,31 +1184,47 @@ function Export-ReportsToExcel([string]$WorkPath,[string]$XlsxPath) {
                 $qt.TextFileCommaDelimiter=($Delimiter -eq ',')
                 $qt.TextFileSpaceDelimiter=$false
                 if ($Delimiter -ne ';' -and $Delimiter -ne ',' -and $Delimiter -ne "`t") { $qt.TextFileOtherDelimiter=[string]$Delimiter }
-                $qt.TextFileColumnDataTypes=@(1..100 | ForEach-Object { 2 })
+                try { $qt.TextFileDecimalSeparator='.' } catch { }
+                # Counts and scores are numbers (sortable, summable); everything else stays text.
+                $types=@($item.Types); if ($types.Count -eq 0) { $types=@(2) }
+                $qt.TextFileColumnDataTypes=[object[]]$types
                 [void]$qt.Refresh($false)
                 $qt.Delete()
                 $qt=$null
-                $sheet.Rows.Item(1).Font.Bold=$true
                 $used=$sheet.UsedRange
-                if ($used.Rows.Count -gt 0 -and $used.Columns.Count -gt 0) {
+                $rowCount=[int]($used.Rows.Count); $colCount=[int]($used.Columns.Count)
+                try {
+                    $header=$sheet.Rows.Item(1)
+                    $header.Font.Bold=$true; $header.WrapText=$true
+                    $headerRange=$sheet.Range(('A1:'+(Get-ColumnLetter $colCount)+'1'))
+                    $headerRange.Interior.Color=7949855; $headerRange.Font.Color=16777215
+                } catch { }
+                if ($rowCount -gt 0 -and $colCount -gt 0) {
                     try { [void]$used.AutoFilter() } catch { }
-                    $rowCount=[int]($used.Rows.Count)
-                    if ($rowCount -le 1000) {
-                        try { [void]$used.Columns.AutoFit() } catch { }
-                        $maxCols=[Math]::Min([int]($used.Columns.Count),100)
-                        for ($c=1; $c -le $maxCols; $c++) {
-                            try { if ($sheet.Columns.Item($c).ColumnWidth -gt 60) { $sheet.Columns.Item($c).ColumnWidth=60 } } catch { }
-                        }
-                    } else {
-                        # AutoFit scans every cell and can take many minutes on a
-                        # wide findings sheet. Fixed width keeps export predictable;
-                        # the full value remains in the cell and formula bar.
-                        try { $used.Columns.ColumnWidth=18 } catch { }
+                    if ($rowCount -le 1000) { try { [void]$used.Columns.AutoFit() } catch { } }
+                    for ($c=1; $c -le [Math]::Min($colCount,$item.Widths.Count); $c++) {
+                        try {
+                            $column=$sheet.Columns.Item($c)
+                            $width=$item.Widths[$c-1]
+                            if ($width -gt 0) { $column.ColumnWidth=$width }
+                            elseif ($rowCount -gt 1000) { $column.ColumnWidth=16 }
+                            elseif ($column.ColumnWidth -gt 40) { $column.ColumnWidth=40 }
+                        } catch { }
                     }
+                    if ($item.Kind -eq 'Priority' -and $rowCount -le 5000) {
+                        foreach ($c in $item.Wrap) { try { $sheet.Columns.Item($c).WrapText=$true } catch { } }
+                        try { $used.VerticalAlignment=-4160; [void]$used.Rows.AutoFit() } catch { } # xlTop
+                    }
+                    foreach ($c in $item.Hidden) { try { $sheet.Columns.Item($c).Hidden=$true } catch { } }
+                    if ($item.PriorityColumn -gt 0 -and $rowCount -gt 1) { try { Add-ExcelPriorityColors $sheet $item $rowCount $colCount } catch { } }
                 }
+                try {
+                    if ($item.Name -eq 'Инциденты') { $sheet.Tab.Color=255 } elseif ($item.Name -eq 'Приоритетные') { $sheet.Tab.Color=39423 }
+                } catch { }
                 try {
                     $sheet.Activate()
                     $excel.ActiveWindow.SplitColumn=0
+                    if ($item.Kind -eq 'Priority') { $excel.ActiveWindow.SplitColumn=3 }
                     $excel.ActiveWindow.SplitRow=1
                     $excel.ActiveWindow.FreezePanes=$true
                 } catch { }
@@ -1177,11 +1256,17 @@ function New-FallbackOverview([string]$WorkPath,[string]$Destination) {
     $w=New-Writer $Destination
     try {
         Write-Row $w @('Тип строки','Event ID','Приоритет','Категория / событие','Компьютер','Начало UTC','Конец UTC','Учетная запись','Источник / IP','Record ID','Количество','Статус','Файл','Комментарий')
+        $incidentPath=Join-Path $WorkPath 'Incidents.csv'
+        if (Test-Path -LiteralPath $incidentPath) {
+            foreach ($r in (Import-Csv -LiteralPath $incidentPath -Delimiter $Delimiter -Encoding UTF8)) {
+                Write-Row $w @(('Инцидент '+$r.'КИ'),$r.'Event ID',$r.'Приоритет',('Оценка '+$r.'Оценка риска'+'; '+$r.'Этапы (тактики)'),$r.'Компьютер',$r.'Начало UTC',$r.'Конец UTC',$r.'Учетные записи',$r.'IP источников','',$r.'Сценариев',$r.'Цепочка атаки',$r.'Папка источника',($r.'Хронология'+' | '+$r.'Что делать'))
+            }
+        }
         $triagePath=Join-Path $WorkPath 'Triage.csv'
         if (Test-Path -LiteralPath $triagePath) {
             Import-Csv -LiteralPath $triagePath -Delimiter $Delimiter -Encoding UTF8 | ForEach-Object {
                 $r=$_
-                Write-Row $w @('Приоритетная находка',$r.'Event ID',$r.'Приоритет',$r.'Сценарий',$r.'Компьютер',$r.'Первое время UTC',$r.'Последнее время UTC',$r.'УЗ / объект / IP','','',$r.'Связанных уникальных событий','Кандидат',$r.'Папка источника',($r.'Основание связи'+' '+$r.'Почему выделено'+' '+$r.'Что проверить'+' '+$r.'Ссылки на находки и EVTX (до 10)'+' '+$r.'Ограничения'))
+                Write-Row $w @(('Приоритетная находка '+$r.'КИ'),$r.'Event ID',$r.'Приоритет',($r.'Сценарий'+' ['+$r.'Оценка риска'+'; '+$r.'MITRE ATT&CK'+']'),$r.'Компьютер',$r.'Первое время UTC',$r.'Последнее время UTC',$r.'Учетные записи',$r.'IP источника','',$r.'Связанных уникальных событий','Кандидат',$r.'Папка источника',($r.'УЗ / объект / IP'+' | '+$r.'Основание связи'+' '+$r.'Почему выделено'+' '+$r.'Что проверить'+' '+$r.'Ссылки на находки и EVTX (до 10)'+' '+$r.'Ограничения'))
             }
         }
         $runPath=Join-Path $WorkPath 'Run.json'
@@ -1378,6 +1463,87 @@ function Get-TaskRisk($r) {
     if ($task.Length -gt 512) { $task=$task.Substring(0,512)+' [обрезано]' }
     return [pscustomobject]@{HasRisk=[bool]($flags.Count -gt 0);Evidence=($flags.ToArray() -join '; ');Object=$task}
 }
+# v9.2 scenario catalog: risk score 0..100, tactic and MITRE ATT&CK technique.
+# Priority is derived from the score: P1 >= 80, P2 >= 50, P3 below.
+$script:P1='P1 — сначала'; $script:P2='P2 — проверить'; $script:P3='P3 — к сведению'
+$script:ScenarioCatalog=@{}
+foreach ($line in @(
+    'Очистка журнала|90|Сокрытие следов|T1070.001 Clear Windows Event Logs|Очистка уничтожает предшествующие события; одна из типовых операций после компрометации.',
+    'Потеря или переполнение журналирования|55|Сокрытие следов|T1562.002 Disable Windows Event Logging|Часть событий не записана; интервал неполноты нужно учитывать при расследовании.',
+    'Журналирование остановлено без перезагрузки|75|Сокрытие следов|T1562.002 Disable Windows Event Logging|Служба журнала остановлена, а система продолжила работу: так отключают запись событий.',
+    'Добавление в привилегированную группу|85|Повышение привилегий|T1098 Account Manipulation|Членство в административной группе дает полный контроль над системой или доменом.',
+    'Выдан удаленный доступ (группа RDP/WinRM)|60|Закрепление|T1098 Account Manipulation|Добавление в Remote Desktop/Remote Management Users открывает удаленный вход.',
+    'Изменение механизма аудита или политики безопасности|70|Обход защиты|T1562.002 Disable Windows Event Logging|Изменение аудита может скрыть последующие действия.',
+    'Изменение политики аудита|65|Обход защиты|T1562.002 Disable Windows Event Logging|Отключение категорий аудита скрывает последующие действия.',
+    'Служба удаленного выполнения (PsExec/Impacket)|95|Выполнение / боковое перемещение|T1569.002 Service Execution; T1021.002 SMB/Admin Shares|Служба запускает командный интерпретатор или пишет в административный общий ресурс — типичный след PsExec, Impacket smbexec/psexec, Cobalt Strike.',
+    'Служба с нетипичными параметрами|65|Закрепление|T1543.003 Windows Service|Служба из нестандартного пути или с нетипичными параметрами — частый способ закрепления.',
+    'Задание с рискованной командой|75|Закрепление / выполнение|T1053.005 Scheduled Task|Задание запускает интерпретатор или закодированную команду.',
+    'Изменение SID History|90|Повышение привилегий|T1134.005 SID-History Injection|SID History позволяет получить права другой УЗ, в том числе администратора домена.',
+    'Назначено опасное право пользователя|70|Повышение привилегий|T1134 Access Token Manipulation|Право позволяет обойти контроль доступа (отладка, резервное копирование, загрузка драйверов и т.п.).',
+    'Выдано право входа по RDP|60|Закрепление|T1098 Account Manipulation|Право SeRemoteInteractiveLogonRight разрешает вход по RDP.',
+    'Обнаружение угрозы Defender|75|Вредоносное ПО|T1204 User Execution|Defender обнаружил вредоносный объект; нужно убедиться, что угроза устранена и не запускалась.',
+    'Ошибка устранения угрозы Defender|90|Вредоносное ПО|T1204 User Execution|Угроза обнаружена, но не устранена — объект может оставаться активным.',
+    'Отключение компонентов защиты Defender|85|Обход защиты|T1562.001 Disable or Modify Tools|Отключение защиты в реальном времени — типовой шаг перед запуском ВПО.',
+    'Добавлено исключение Defender|85|Обход защиты|T1562.001 Disable or Modify Tools|Исключение позволяет хранить и запускать ВПО без проверки.',
+    'Попытка изменить Defender заблокирована|70|Обход защиты|T1562.001 Disable or Modify Tools|Tamper Protection остановила изменение настроек: кто-то пытался ослабить защиту.',
+    'ASR заблокировал операцию|65|Выполнение|T1204 User Execution|Правило Attack Surface Reduction остановило подозрительное действие процесса.',
+    'Отключение службы защиты или журналирования|85|Обход защиты|T1562.001 Disable or Modify Tools|Служба защиты или журналирования переведена в состояние «Отключена».',
+    'Аварийная остановка службы защиты или журналирования|55|Обход защиты|T1562.001 Disable or Modify Tools|Неожиданная остановка службы защиты может быть сбоем или принудительным завершением.',
+    'Sysmon: вмешательство в процесс|90|Обход защиты|T1055 Process Injection|Подмена образа процесса (Process Hollowing/Herpaderping) характерна для ВПО.',
+    'Изменение конфигурации Sysmon|60|Обход защиты|T1562.001 Disable or Modify Tools|Изменение фильтров Sysmon может скрыть активность.',
+    'Сторонний антивирус: признаки угрозы|70|Вредоносное ПО|T1204 User Execution|Продукт защиты сообщил об угрозе.',
+    'Значительное изменение времени пользователем|60|Сокрытие следов|T1070.006 Timestomp|Перевод часов искажает хронологию событий.',
+    'Потенциально опасная команда|75|Выполнение|T1059 Command and Scripting Interpreter|Команда удаляет следы, ослабляет защиту или загружает и исполняет код.',
+    'RDP-вход с внешнего IP|70|Первоначальный доступ|T1133 External Remote Services; T1021.001 Remote Desktop Protocol|Успешный RDP-вход с публичного адреса: RDP опубликован в интернет или используется внешний доступ.',
+    'Подбор пароля к УЗ|55|Доступ к учетным данным|T1110.001 Password Guessing|Серия отказов для одной УЗ с одного источника; бывает и из-за сохраненного старого пароля.',
+    'Password spraying с одного источника|80|Доступ к учетным данным|T1110.003 Password Spraying|Отказы для многих разных УЗ с одного источника — признак перебора паролей.',
+    'Массовая блокировка УЗ|80|Доступ к учетным данным|T1110.003 Password Spraying|Много разных УЗ заблокировано за короткое время — признак перебора паролей.',
+    'Отказы RDP с неверным паролем → успешный вход|95|Первоначальный доступ|T1110 Brute Force → T1021.001 Remote Desktop Protocol|После серии неверных паролей с того же IP выполнен успешный RDP-вход — возможный успешный подбор.',
+    'Новая УЗ получила привилегии|90|Закрепление / повышение привилегий|T1136.001 Create Local Account → T1098 Account Manipulation|Только что созданная УЗ сразу получила административные права.',
+    'Новая УЗ → RDP-вход|85|Закрепление|T1136 Create Account → T1021.001 Remote Desktop Protocol|Только что созданная УЗ сразу использована для RDP-входа.',
+    'Включение/сброс УЗ → RDP-вход|85|Закрепление / боковое перемещение|T1098 Account Manipulation → T1021.001 Remote Desktop Protocol|УЗ включена или ей сброшен пароль, после чего под ней сразу выполнен RDP-вход.',
+    'Временная УЗ: создана и удалена|80|Закрепление / сокрытие следов|T1136 Create Account; T1070 Indicator Removal|УЗ существовала недолго — типично для временной УЗ злоумышленника.',
+    'Изменение аудита → потеря/очистка журналирования|95|Сокрытие следов|T1562.002 → T1070.001|Та же сессия изменила аудит и затем очистила или потеряла журнал.',
+    'Обнаружение угрозы → отключение защиты|95|Обход защиты|T1562.001 Disable or Modify Tools|После обнаружения угрозы защита на том же компьютере ослаблена.',
+    'Локально добавлено правило Firewall|40|Обход защиты|T1562.004 Disable or Modify System Firewall|Новое правило может открыть порт; часто создается установщиками ПО.'
+)) {
+    $p=$line.Split('|')
+    $script:ScenarioCatalog[$p[0]]=[pscustomobject]@{Score=[int]$p[1];Tactic=$p[2];Mitre=$p[3];Why=$p[4]}
+}
+# RDP session actions: Event ID -> text and score.
+$script:RdpImpact=@{4697=@('создание службы',90);4698=@('создание задания',90);4702=@('изменение задания',85);4719=@('изменение политики аудита',90);
+    4904=@('регистрация источника Security',85);4905=@('отмена источника Security',85);4906=@('изменение CrashOnAuditFail',85);4907=@('изменение параметров аудита объекта',85);
+    4715=@('изменение SACL политики аудита',85);4739=@('изменение доменной политики',85);4946=@('добавление правила Firewall',70);4947=@('изменение правила Firewall',70);
+    4948=@('удаление правила Firewall',70);4720=@('создание УЗ',90);4722=@('включение УЗ',85);4724=@('сброс пароля',85);4726=@('удаление УЗ',85);
+    4728=@('добавление в глобальную группу',85);4732=@('добавление в локальную группу',85);4756=@('добавление в универсальную группу',85);
+    4704=@('назначение права',85);4765=@('добавление SID History',95);4616=@('изменение времени',75);4648=@('вход с явными учетными данными',60);
+    1102=@('очистка журнала Security',95);104=@('очистка журнала',95)}
+function Get-PriorityFromScore([int]$Score) {
+    if ($Score -ge 80) { return $script:P1 }
+    if ($Score -ge 50) { return $script:P2 }
+    return $script:P3
+}
+function Triage-IsPublicIp([string]$Ip) {
+    # Public = globally routable. Private, loopback, link-local, CGNAT and documentation ranges are not.
+    $value=Triage-NormalIp $Ip
+    $addr=$null
+    if (-not $value -or -not [Net.IPAddress]::TryParse($value,[ref]$addr)) { return $false }
+    $b=$addr.GetAddressBytes()
+    if ($b.Length -eq 4) {
+        if ($b[0] -in @(0,10,127) -or $b[0] -ge 224) { return $false }
+        if ($b[0] -eq 169 -and $b[1] -eq 254) { return $false }
+        if ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) { return $false }
+        if ($b[0] -eq 192 -and $b[1] -eq 168) { return $false }
+        if ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) { return $false }
+        if (($b[0] -eq 192 -and $b[1] -eq 0 -and $b[2] -eq 2) -or ($b[0] -eq 198 -and $b[1] -eq 51 -and $b[2] -eq 100) -or ($b[0] -eq 203 -and $b[1] -eq 0 -and $b[2] -eq 113)) { return $false }
+        if ($b[0] -eq 198 -and $b[1] -in @(18,19)) { return $false }
+        return $true
+    }
+    # IPv6: only global unicast 2000::/3, excluding documentation 2001:db8::/32.
+    if (($b[0] -band 0xE0) -ne 0x20) { return $false }
+    if ($b[0] -eq 0x20 -and $b[1] -eq 0x01 -and $b[2] -eq 0x0d -and $b[3] -eq 0xb8) { return $false }
+    return $true
+}
 function Add-Triage {
     [CmdletBinding(PositionalBinding=$false)]
     param(
@@ -1385,10 +1551,15 @@ function Add-Triage {
         [Parameter(Mandatory=$true)][string]$Priority,
         [Parameter(Mandatory=$true)][string]$Scenario,
         [Parameter(Mandatory=$true)][string]$Evidence,
-        [Parameter(Mandatory=$true)][string]$Why,
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Why,
         [Parameter(Mandatory=$true)][string]$Check,
         [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Object,
-        [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][object[]]$Rows
+        [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][object[]]$Rows,
+        [int]$Score=0,
+        [string]$Tactic='',
+        [string]$Mitre='',
+        [string]$LastTime='',
+        [long]$EventCount=0
     )
     $firstRow=$Rows[0]
     foreach ($row in $Rows) {
@@ -1399,18 +1570,29 @@ function Add-Triage {
             throw 'Add-Triage: попытка связать разные компьютеры или папки.'
         }
     }
+    $catalog=$script:ScenarioCatalog[$Scenario]
+    if ($catalog) {
+        if ($Score -le 0) { $Score=$catalog.Score }
+        if (-not $Tactic) { $Tactic=$catalog.Tactic }
+        if (-not $Mitre) { $Mitre=$catalog.Mitre }
+        if (-not $Why -or $Why -ceq $Evidence) { $Why=$catalog.Why }
+    }
+    if ($Score -gt 0) { $Score=[Math]::Min(100,$Score); $Priority=Get-PriorityFromScore $Score }
     $scope=Triage-Scope $firstRow
     $key=$Scenario+'|'+$scope+'|'+$Object
     if (-not $Groups.ContainsKey($key)) {
         $Groups[$key]=[pscustomobject]@{
-            Priority=$Priority; Scenario=$Scenario; Evidence=$Evidence; Why=$Why; Check=$Check; Object=$Object
+            Priority=$Priority; Score=$Score; Tactic=$Tactic; Mitre=$Mitre; Scenario=$Scenario; Evidence=$Evidence; Why=$Why; Check=$Check; Object=$Object
             Computer=(Triage-Value $firstRow 'Компьютер'); Scope=(Triage-Value $firstRow 'Папка источника')
             First=''; Last=''; Seen=(New-Object 'System.Collections.Generic.HashSet[string]')
             Ids=(New-Object 'System.Collections.Generic.HashSet[string]'); Refs=(New-Object 'System.Collections.Generic.List[string]')
-            Recovered=$false
+            Accounts=(New-Object 'System.Collections.Generic.List[string]'); Ips=(New-Object 'System.Collections.Generic.List[string]')
+            Recovered=$false; EventCount=[long]0; Incident=''
         }
     }
     $g=$Groups[$key]
+    if ($Score -gt $g.Score) { $g.Score=$Score; $g.Priority=$Priority }
+    $g.EventCount+=$EventCount
     foreach ($r in $Rows) {
         if ($null -eq $r) { continue }
         if (-not $g.Seen.Add((Triage-Key $r))) { continue }
@@ -1420,71 +1602,138 @@ function Add-Triage {
         [void]$g.Ids.Add((Triage-Value $r 'Event ID'))
         if ($g.Refs.Count -lt 10) { [void]$g.Refs.Add(('Находка '+(Triage-Value $r 'Номер')+'; '+(Triage-Value $r 'Полный путь')+'; Record ID='+(Triage-Value $r 'Record ID'))) }
         if (Triage-Value $r 'Восстановление XML') { $g.Recovered=$true }
+        $account=Triage-Value $r 'Целевая УЗ'
+        if (-not $account) { $account=Triage-Value $r 'Инициатор' }
+        foreach ($a in ($account -split ' \| ')) { if ($a -and $g.Accounts.Count -lt 10 -and -not $g.Accounts.Contains($a)) { $g.Accounts.Add($a) } }
+        $ip=Triage-NormalIp (Triage-Value $r 'IP источника')
+        if ((Triage-IsRemoteIp $ip) -and $g.Ips.Count -lt 10 -and -not $g.Ips.Contains($ip)) { $g.Ips.Add($ip) }
     }
+    if ($LastTime -and [string]::CompareOrdinal($LastTime,$g.Last) -gt 0) { $g.Last=$LastTime }
 }
+$script:ProtectionServiceKeys='(?i)^(WinDefend|Sense|WdNisSvc|WdBoot|WdFilter|MpsSvc|EventLog|wscsvc|SecurityHealthService|Sysmon|Sysmon64|SysmonDrv)$'
+$script:ProtectionServiceNames='(?i)(defender|антивирусн|event ?log|журнал(а)? событий|firewall|брандмауэр|security center|центр обеспечения безопасности|sysmon|sense)'
+$script:DangerousPrivileges='(?i)(SeDebugPrivilege|SeTcbPrivilege|SeBackupPrivilege|SeRestorePrivilege|SeTakeOwnershipPrivilege|SeLoadDriverPrivilege|SeImpersonatePrivilege|SeAssignPrimaryTokenPrivilege|SeCreateTokenPrivilege|SeEnableDelegationPrivilege|SeSecurityPrivilege|SeManageVolumePrivilege)'
+$script:RemoteExecService='(?i)(%COMSPEC%|\bcmd(\.exe)?["'']?\s+/[ckqr]\b|\bpowershell|\bpwsh\b|\\\\127\.0\.0\.1\\|\\\\localhost\\|\\ADMIN\$|\\C\$\\|\\__output|\bPSEXESVC\b|\bRemComSvc\b|\bcsexec|\bwinexesvc\b|\brundll32\b|\bmshta\b|\bregsvr32\b|frombase64string|-enc(odedcommand)?\s)'
 function Add-SingleTriage($Groups,$r) {
     $id=[int](Triage-Value $r 'Event ID'); $provider=Triage-Value $r 'Провайдер'
     $security=$provider -eq 'Microsoft-Windows-Security-Auditing'
     if ($security -and (Triage-Value $r 'Результат аудита') -eq (Ru-AuditOutcome 'Failure')) { return }
     $target=Triage-Value $r 'Целевая УЗ'; $data=Triage-Value $r 'Данные события'
     if ($provider -eq 'Microsoft-Windows-Eventlog' -and $id -in @(1102,104)) {
-        Add-Triage -Groups $Groups -Priority 'P1 — сначала' -Scenario 'Очистка журнала' -Evidence 'Факт: EventLog зафиксировал очистку.' -Why 'Очистка скрывает предшествующий контекст, но может быть штатной операцией.' -Check 'Установить инициатора, очищенный журнал, основание, соседние операции и полноту выгрузки.' -Object ((Triage-Value $r 'Инициатор')+' | '+$data) -Rows @($r)
+        Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Очистка журнала' -Evidence 'Факт: EventLog зафиксировал очистку журнала.' -Why 'Факт: EventLog зафиксировал очистку журнала.' -Check 'Установить инициатора, очищенный журнал, основание, соседние операции и полноту выгрузки.' -Object ((Triage-Value $r 'Инициатор')+' | '+$data) -Rows @($r)
     }
     if ($provider -eq 'Microsoft-Windows-Eventlog' -and $id -in @(1101,1104,1108)) {
-        Add-Triage -Groups $Groups -Priority 'P1 — сначала' -Scenario 'Потеря или переполнение журналирования' -Evidence 'Факт: EventLog сообщил о потере, заполнении или ошибке приема событий.' -Why 'Факт: EventLog сообщил о потере, заполнении или ошибке приема событий.' -Check 'Определить интервал неполноты, причину, размер журналов и наличие централизованной копии.' -Object ((Triage-Value $r 'Событие')+' | '+$data) -Rows @($r)
+        Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Потеря или переполнение журналирования' -Evidence 'Факт: EventLog сообщил о потере, заполнении или ошибке приема событий.' -Why 'Факт: EventLog сообщил о потере, заполнении или ошибке приема событий.' -Check 'Определить интервал неполноты, причину, размер журналов и наличие централизованной копии.' -Object ((Triage-Value $r 'Событие')+' | '+$data) -Rows @($r)
     }
-    if ($security -and $id -in @(4728,4732,4756) -and (Is-PrivilegedGroup (Triage-Value $r 'SID целевой УЗ'))) {
-        Add-Triage -Groups $Groups -Priority 'P1 — сначала' -Scenario 'Добавление в привилегированную группу' -Evidence 'Факт: SID группы относится к известной административной группе.' -Why 'Факт: SID группы относится к известной административной группе.' -Check 'Проверить заявку, инициатора, SID участника и последующие действия этой УЗ.' -Object ((Triage-Value $r 'SID участника')+' -> '+(Triage-Value $r 'SID целевой УЗ')) -Rows @($r)
+    if ($security -and $id -in @(4728,4732,4756)) {
+        $groupSid=Triage-Value $r 'SID целевой УЗ'
+        if (Is-PrivilegedGroup $groupSid) {
+            Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Добавление в привилегированную группу' -Evidence 'Факт: SID группы относится к известной административной группе.' -Why 'Факт: SID группы относится к известной административной группе.' -Check 'Проверить заявку, инициатора, SID участника и последующие действия этой УЗ.' -Object ((Triage-Value $r 'SID участника')+' -> '+$groupSid) -Rows @($r)
+        } elseif ($groupSid -in @('S-1-5-32-555','S-1-5-32-580')) {
+            Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Выдан удаленный доступ (группа RDP/WinRM)' -Evidence 'Факт: участник добавлен в Remote Desktop Users (S-1-5-32-555) или Remote Management Users (S-1-5-32-580).' -Why '' -Check 'Проверить заявку, инициатора, участника и последующие удаленные входы этой УЗ.' -Object ((Triage-Value $r 'SID участника')+' -> '+$groupSid) -Rows @($r)
+        }
     }
     if ($security -and $id -in @(4904,4905,4906,4907,4739,4715)) {
-        Add-Triage -Groups $Groups -Priority 'P2 — проверить' -Scenario 'Изменение механизма аудита или политики безопасности' -Evidence 'Факт: зарегистрировано изменение источника Security, CrashOnAuditFail, параметров аудита объекта или доменной политики.' -Why 'Факт: зарегистрировано изменение источника Security, CrashOnAuditFail, параметров аудита объекта или доменной политики.' -Check 'Проверить инициатора, точное старое/новое значение, заявку и последующие потери журналов.' -Object ((Triage-Value $r 'Инициатор')+' | '+$data) -Rows @($r)
+        Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Изменение механизма аудита или политики безопасности' -Evidence 'Факт: зарегистрировано изменение источника Security, CrashOnAuditFail, SACL политики аудита, параметров аудита объекта или доменной политики.' -Why 'Факт: зарегистрировано изменение источника Security, CrashOnAuditFail, SACL политики аудита, параметров аудита объекта или доменной политики.' -Check 'Проверить инициатора, точное старое/новое значение, заявку и последующие потери журналов.' -Object ((Triage-Value $r 'Инициатор')+' | '+$data) -Rows @($r)
     }
     if ($security -and $id -eq 4719) {
-        Add-Triage -Groups $Groups -Priority 'P2 — проверить' -Scenario 'Изменение политики аудита' -Evidence 'Факт: Windows сообщает об изменении политики аудита; сам по себе оно может быть плановым.' -Why 'Факт: Windows сообщает об изменении политики аудита; сам по себе оно может быть плановым.' -Check 'Проверить категорию/подкатегорию, Success/Failure, инициатора, Logon ID и основание изменения.' -Object ((Triage-Value $r 'Инициатор')+' | '+$data) -Rows @($r)
+        Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Изменение политики аудита' -Evidence 'Факт: Windows сообщает об изменении политики аудита; само по себе оно может быть плановым.' -Why 'Факт: Windows сообщает об изменении политики аудита; само по себе оно может быть плановым.' -Check 'Проверить категорию/подкатегорию, Success/Failure, инициатора, Logon ID и основание изменения.' -Object ((Triage-Value $r 'Инициатор')+' | '+$data) -Rows @($r)
     }
     if ($security -and $id -eq 4946) {
-        Add-Triage -Groups $Groups -Priority 'P2 — проверить' -Scenario 'Локально добавлено правило Firewall' -Evidence 'Факт: это локальное добавление правила; событие 4946 не возникает при добавлении через GPO.' -Why 'Факт: это локальное добавление правила; событие 4946 не возникает при добавлении через GPO.' -Check 'Проверить имя правила, профиль, направление, адреса/порты и согласование.' -Object (Triage-DataValue $r @('RuleName','RuleId')) -Rows @($r)
+        Add-Triage -Groups $Groups -Priority $script:P3 -Scenario 'Локально добавлено правило Firewall' -Evidence 'Факт: это локальное добавление правила; событие 4946 не возникает при добавлении через GPO.' -Why '' -Check 'Проверить имя правила, профиль, направление, адреса/порты и согласование.' -Object (Triage-DataValue $r @('RuleName','RuleId')) -Rows @($r)
     }
     if ((($security -and $id -eq 4697) -or ($provider -eq 'Service Control Manager' -and $id -eq 7045))) {
-        $risk=Get-ServiceRisk $r
-        if ($risk.HasRisk) {
-            Add-Triage -Groups $Groups -Priority 'P2 — проверить' -Scenario 'Служба с нетипичными параметрами' -Evidence ('Эвристика по полям службы: '+$risk.Evidence+'.') -Why ('Эвристика по полям службы: '+$risk.Evidence+'.') -Check 'Проверить путь, подпись, тип и запуск службы, учетную запись, владельца ПО и заявку.' -Object $risk.Object -Rows @($r)
+        $image=Triage-DataValue $r @('ServiceFileName','ImagePath','BinaryPathName')
+        $serviceName=Triage-DataValue $r @('ServiceName')
+        if (($image+' '+$serviceName) -match $script:RemoteExecService) {
+            Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Служба удаленного выполнения (PsExec/Impacket)' -Evidence ('Факт: путь службы содержит «'+$Matches[0]+'».') -Why '' -Check 'Установить, с какого узла и под какой УЗ создана служба (соседние 4624 тип 3 / 4648), что исполнялось, и проверить узел-источник.' -Object ($serviceName+' | '+$image) -Rows @($r)
+        } else {
+            $risk=Get-ServiceRisk $r
+            if ($risk.HasRisk) {
+                Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Служба с нетипичными параметрами' -Evidence ('Эвристика по полям службы: '+$risk.Evidence+'.') -Why ('Эвристика по полям службы: '+$risk.Evidence+'.') -Check 'Проверить путь, подпись, тип и запуск службы, учетную запись, владельца ПО и заявку.' -Object $risk.Object -Rows @($r)
+            }
         }
     }
     if ((($security -and $id -in @(4698,4702)) -or ($provider -eq 'Microsoft-Windows-TaskScheduler' -and $id -in @(106,140)))) {
         $risk=Get-TaskRisk $r
         if ($risk.HasRisk) {
-            Add-Triage -Groups $Groups -Priority 'P2 — проверить' -Scenario 'Задание с рискованной командой' -Evidence ('Эвристика по содержимому задания: '+$risk.Evidence+'.') -Why ('Эвристика по содержимому задания: '+$risk.Evidence+'.') -Check 'Открыть полное XML задания, проверить команду, триггер, учетную запись выполнения, путь и заявку.' -Object $risk.Object -Rows @($r)
+            Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Задание с рискованной командой' -Evidence ('Эвристика по содержимому задания: '+$risk.Evidence+'.') -Why ('Эвристика по содержимому задания: '+$risk.Evidence+'.') -Check 'Открыть полное XML задания, проверить команду, триггер, учетную запись выполнения, путь и заявку.' -Object $risk.Object -Rows @($r)
         }
     }
-    if ($security -and $id -in @(4704,4765)) {
-        Add-Triage -Groups $Groups -Priority 'P2 — проверить' -Scenario 'Изменение прав или SID History' -Evidence 'Факт: назначено право пользователя либо добавлен SID History.' -Why 'Факт: назначено право пользователя либо добавлен SID History.' -Check 'Проверить выданное право, целевую УЗ и основание изменения.' -Object ($target+' | '+(Triage-Value $r 'Привилегии')) -Rows @($r)
+    if ($security -and $id -in @(4765,4766)) {
+        Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Изменение SID History' -Evidence ('Факт: событие '+$id+' — добавление SID History (4766 — неудачная попытка).') -Why '' -Check 'Проверить целевую УЗ, добавляемый SID, инициатора; SID History вне миграции домена почти всегда злонамерен.' -Object ($target+' | '+(Triage-DataValue $r @('SidHistory','SourceSid'))) -Rows @($r)
     }
-    if ($provider -eq 'Microsoft-Windows-Windows Defender' -and $id -in @(1006,1015,1116,1008,1118,1119,5001,5010,5012)) {
-        $scenario='Обнаружение угрозы Defender'; $priority='P2 — проверить'
-        if ($id -in @(1008,1118,1119)) { $scenario='Ошибка устранения угрозы Defender'; $priority='P1 — сначала' }
-        if ($id -in @(5001,5010,5012)) { $scenario='Отключение компонентов защиты Defender' }
-        Add-Triage -Groups $Groups -Priority $priority -Scenario $scenario -Evidence 'Факт: событие Defender требует сверки результата обработки и состояния защиты.' -Why 'Факт: событие Defender требует сверки результата обработки и состояния защиты.' -Check 'Сопоставить обнаружение с действием, проверить объект, исключения, состояние защиты и согласованные изменения.' -Object ((Triage-Value $r 'Имя угрозы')+' | '+(Triage-Value $r 'Ресурс / путь')) -Rows @($r)
+    if ($security -and $id -eq 4704) {
+        $privileges=Triage-Value $r 'Привилегии'
+        if ($privileges -match $script:DangerousPrivileges) {
+            Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Назначено опасное право пользователя' -Evidence ('Факт: назначено право '+$Matches[0]+'.') -Why '' -Check 'Проверить, кому выдано право (TargetSid), инициатора и основание изменения.' -Object ((Triage-Value $r 'SID целевой УЗ')+' | '+$privileges) -Rows @($r)
+        }
+    }
+    if ($security -and $id -eq 4717 -and (Triage-Value $r 'Привилегии') -match 'SeRemoteInteractiveLogonRight') {
+        Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Выдано право входа по RDP' -Evidence 'Факт: учетной записи предоставлено SeRemoteInteractiveLogonRight.' -Why '' -Check 'Проверить, кому выдано право, инициатора и последующие RDP-входы.' -Object (Triage-Value $r 'SID целевой УЗ') -Rows @($r)
+    }
+    if ($provider -eq 'Microsoft-Windows-Windows Defender') {
+        if ($id -in @(1006,1015,1116,1008,1118,1119,5001,5010,5012)) {
+            $scenario='Обнаружение угрозы Defender'
+            if ($id -in @(1008,1118,1119)) { $scenario='Ошибка устранения угрозы Defender' }
+            if ($id -in @(5001,5010,5012)) { $scenario='Отключение компонентов защиты Defender' }
+            Add-Triage -Groups $Groups -Priority $script:P2 -Scenario $scenario -Evidence ('Факт: Defender, событие '+$id+'.') -Why '' -Check 'Сопоставить обнаружение с действием, проверить объект, процесс, пользователя, исключения и состояние защиты.' -Object ((Triage-Value $r 'Имя угрозы')+' | '+(Triage-Value $r 'Ресурс / путь')) -Rows @($r)
+        }
+        if ($id -eq 5007) {
+            $newValue=Triage-DataValue $r @('New Value','NewValue')
+            if ($newValue -match '(?i)\\Exclusions\\') {
+                Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Добавлено исключение Defender' -Evidence 'Факт: в настройках Defender появилось исключение (путь, расширение или процесс).' -Why '' -Check 'Проверить исключенный объект, кто и когда его добавил (GPO/Intune/локально), и что находится по этому пути.' -Object $newValue -Rows @($r)
+            } elseif ($newValue -match '(?i)\\(DisableRealtimeMonitoring|DisableBehaviorMonitoring|DisableIOAVProtection|DisableOnAccessProtection|DisableScanOnRealtimeEnable|DisableAntiSpyware|DisableAntiVirus)\s*=\s*0x0*1\b') {
+                Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Отключение компонентов защиты Defender' -Evidence ('Факт: параметр '+$Matches[1]+' включен (защита выключена).') -Why '' -Check 'Проверить, кто изменил параметр (GPO/локально), длительность и действия в этот период.' -Object $newValue -Rows @($r)
+            }
+        }
+        if ($id -eq 5013) {
+            Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Попытка изменить Defender заблокирована' -Evidence 'Факт: Tamper Protection заблокировала изменение настройки Defender.' -Why '' -Check 'Установить процесс и пользователя, пытавшихся изменить настройку, и что происходило рядом по времени.' -Object $data -Rows @($r)
+        }
+        if ($id -eq 1121) {
+            Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'ASR заблокировал операцию' -Evidence 'Факт: правило Attack Surface Reduction заблокировало операцию.' -Why '' -Check 'Проверить правило (ID), процесс, путь и пользователя; ложные срабатывания на легитимном ПО возможны.' -Object ((Triage-DataValue $r @('Process Name','ProcessName'))+' | '+(Triage-DataValue $r @('Path'))) -Rows @($r)
+        }
+    }
+    if ($provider -eq 'Service Control Manager' -and $id -eq 7040) {
+        $key=Triage-DataValue $r @('param4'); $display=Triage-DataValue $r @('param1'); $newType=Triage-DataValue $r @('param3')
+        if ($newType -match '(?i)disabled|отключ' -and ($key -match $script:ProtectionServiceKeys -or $display -match $script:ProtectionServiceNames)) {
+            Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Отключение службы защиты или журналирования' -Evidence ('Факт: тип запуска службы «'+$display+'» изменен на «'+$newType+'».') -Why '' -Check 'Установить инициатора (соседние события, 4624/4688), вернуть службу и проверить период, когда она была отключена.' -Object ($display+' | '+$key) -Rows @($r)
+        }
+    }
+    if ($provider -eq 'Service Control Manager' -and $id -in @(7031,7034)) {
+        $display=Triage-DataValue $r @('param1')
+        if ($display -match $script:ProtectionServiceNames) {
+            Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Аварийная остановка службы защиты или журналирования' -Evidence ('Факт: служба «'+$display+'» неожиданно завершилась.') -Why '' -Check 'Проверить повторяемость, соседние ошибки и действия пользователей рядом по времени.' -Object $display -Rows @($r)
+        }
     }
     if ($provider -eq 'Microsoft-Windows-Sysmon' -and $id -eq 25) {
-        Add-Triage -Groups $Groups -Priority 'P1 — сначала' -Scenario 'Sysmon: вмешательство в процесс' -Evidence 'Факт: Sysmon сообщил о ProcessTampering; событие ориентировано на техники скрытия/изменения процесса.' -Why 'Факт: Sysmon сообщил о ProcessTampering; событие ориентировано на техники скрытия/изменения процесса.' -Check 'Проверить исходный и целевой процессы, подписи, хеши, родителя и контекст EDR.' -Object ((Triage-DataValue $r @('Image','SourceImage'))+' -> '+(Triage-DataValue $r @('TargetImage'))) -Rows @($r)
+        Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Sysmon: вмешательство в процесс' -Evidence 'Факт: Sysmon сообщил о ProcessTampering; событие ориентировано на техники скрытия/изменения процесса.' -Why 'Факт: Sysmon сообщил о ProcessTampering; событие ориентировано на техники скрытия/изменения процесса.' -Check 'Проверить исходный и целевой процессы, подписи, хеши, родителя и контекст EDR.' -Object ((Triage-DataValue $r @('Image','SourceImage'))+' -> '+(Triage-DataValue $r @('TargetImage'))) -Rows @($r)
     }
     if ($provider -eq 'Microsoft-Windows-Sysmon' -and $id -eq 16) {
-        Add-Triage -Groups $Groups -Priority 'P2 — проверить' -Scenario 'Изменение конфигурации Sysmon' -Evidence 'Факт: Sysmon сообщил об изменении собственной конфигурации.' -Why 'Факт: Sysmon сообщил об изменении собственной конфигурации.' -Check 'Сверить конфигурацию, инициатора и изменения фильтров с эталоном и заявкой.' -Object (Triage-DataValue $r @('Configuration','ConfigurationFileHash')) -Rows @($r)
+        Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Изменение конфигурации Sysmon' -Evidence 'Факт: Sysmon сообщил об изменении собственной конфигурации.' -Why 'Факт: Sysmon сообщил об изменении собственной конфигурации.' -Check 'Сверить конфигурацию, инициатора и изменения фильтров с эталоном и заявкой.' -Object (Triage-DataValue $r @('Configuration','ConfigurationFileHash')) -Rows @($r)
     }
     if ((Triage-Value $r 'Правило') -eq 'AV-VENDOR-THREAT') {
-        Add-Triage -Groups $Groups -Priority 'P2 — проверить' -Scenario 'Сторонний антивирус: признаки угрозы' -Evidence 'Эвристика v3 нашла признаки угрозы в XML/описании; это не подтверждение заражения.' -Why 'Эвристика v3 нашла признаки угрозы в XML/описании; это не подтверждение заражения.' -Check 'Проверить точный смысл события продукта, объект и результат лечения в полном описании.' -Object ((Triage-Value $r 'Провайдер')+' | '+(Triage-Value $r 'Имя угрозы')+' | '+(Triage-Value $r 'Ресурс / путь')) -Rows @($r)
+        Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Сторонний антивирус: признаки угрозы' -Evidence 'Эвристика нашла признаки угрозы в XML/описании; это не подтверждение заражения.' -Why 'Эвристика нашла признаки угрозы в XML/описании; это не подтверждение заражения.' -Check 'Проверить точный смысл события продукта, объект и результат лечения в полном описании.' -Object ((Triage-Value $r 'Провайдер')+' | '+(Triage-Value $r 'Имя угрозы')+' | '+(Triage-Value $r 'Ресурс / путь')) -Rows @($r)
     }
     if ($security -and $id -eq 4616) {
         $delta=0.0; $sid=Triage-Value $r 'SID инициатора'
         if ($sid -and -not (Triage-IsServiceSid $sid) -and [double]::TryParse((Triage-Value $r 'Сдвиг времени, сек'),[Globalization.NumberStyles]::Float,$script:Invariant,[ref]$delta) -and [Math]::Abs($delta) -ge 300) {
-            Add-Triage -Groups $Groups -Priority 'P2 — проверить' -Scenario 'Значительное изменение времени пользователем' -Evidence 'Факт: сдвиг не менее 5 минут; инициатор не служебная УЗ.' -Why 'Факт: сдвиг не менее 5 минут; инициатор не служебная УЗ.' -Check 'Проверить старое и новое время, процесс и согласованную корректировку часов.' -Object (Triage-Value $r 'Инициатор') -Rows @($r)
+            Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Значительное изменение времени пользователем' -Evidence 'Факт: сдвиг не менее 5 минут; инициатор не служебная УЗ.' -Why 'Факт: сдвиг не менее 5 минут; инициатор не служебная УЗ.' -Check 'Проверить старое и новое время, процесс и согласованную корректировку часов.' -Object (Triage-Value $r 'Инициатор') -Rows @($r)
         }
     }
     if ((Triage-Value $r 'Правило') -eq 'HEURISTIC-COMMAND') {
         $command=(Triage-Value $r 'Командная строка')+' '+$data
         if ($command -match '(?i)(wevtutil\s+(cl|clear-log)\b|Clear-EventLog\b|vssadmin\s+delete\s+shadows|Set-MpPreference\b.{0,120}-Disable\w+\s+\$true|Add-MpPreference\b.{0,120}-Exclusion)' -or ($command -match '(?i)DownloadString' -and $command -match '(?i)\b(IEX|Invoke-Expression)\b')) {
-            Add-Triage -Groups $Groups -Priority 'P2 — проверить' -Scenario 'Потенциально опасная команда' -Evidence 'Эвристика: признаки удаления следов, ослабления защиты либо загрузки и исполнения кода. Текст мог быть цитатой.' -Why 'Эвристика: признаки удаления следов, ослабления защиты либо загрузки и исполнения кода. Текст мог быть цитатой.' -Check 'Прочитать команду и полный ScriptBlock в EVTX; установить родительский процесс, автора и результат исполнения.' -Object ((Triage-Value $r 'Инициатор')+' | '+(Triage-Value $r 'Процесс')) -Rows @($r)
+            Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Потенциально опасная команда' -Evidence 'Эвристика: признаки удаления следов, ослабления защиты либо загрузки и исполнения кода. Текст мог быть цитатой.' -Why 'Эвристика: признаки удаления следов, ослабления защиты либо загрузки и исполнения кода. Текст мог быть цитатой.' -Check 'Прочитать команду и полный ScriptBlock в EVTX; установить родительский процесс, автора и результат исполнения.' -Object ((Triage-Value $r 'Инициатор')+' | '+(Triage-Value $r 'Процесс')) -Rows @($r)
+        }
+    }
+    # Successful RDP from a globally routable address (Security 4624 type 10 or RemoteConnectionManager 1149).
+    $rdpLogon=($security -and $id -eq 4624 -and (Triage-Value $r 'Тип входа') -eq '10') -or ($provider -eq 'Microsoft-Windows-TerminalServices-RemoteConnectionManager' -and $id -eq 1149)
+    if ($rdpLogon) {
+        $ip=Triage-NormalIp (Triage-Value $r 'IP источника')
+        if (Triage-IsPublicIp $ip) {
+            $who=$target; if (-not $who) { $who=Triage-DataValue $r @('Param1','User') }
+            Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'RDP-вход с внешнего IP' -Evidence ('Факт: успешная RDP-аутентификация/вход с публичного адреса '+$ip+'.') -Why '' -Check 'Проверить владельца IP (whois/геолокация), ожидаемость удаленного доступа для этой УЗ, VPN/шлюз и действия в сеансе (лист RDP_сеансы).' -Object ($who+' | '+$ip) -Rows @($r)
         }
     }
 }
@@ -1541,22 +1790,67 @@ function Add-ChainTriage($Groups,[object[]]$Rows) {
 }
 function Add-ChainTriageCore($Groups,[object[]]$Rows) {
     $created=@{}; $opened=@{}; $rdp=@{}; $audit=@{}
+    $lockouts=New-Object 'System.Collections.Generic.Queue[object]'; $lastLockoutAlert=[long]0
+    $lastThreat=$null; $logStop=$null
+    $windowTicks=[long]$TriageWindowMinutes*[TimeSpan]::TicksPerMinute
+    $failureWindowTicks=[long]$WindowMinutes*[TimeSpan]::TicksPerMinute
+    $dayTicks=[TimeSpan]::TicksPerDay
     $orderedRows=@($Rows | Sort-Object @{Expression={[DateTimeOffset]::Parse($_.'Время UTC',$script:Invariant).UtcDateTime.Ticks}},@{Expression={$_.'Полный путь'}},@{Expression={[long]$_.'Record ID'}})
     Add-PasswordSuccessTriage $Groups $orderedRows
     foreach ($r in $orderedRows) {
         $id=[int]$r.'Event ID'; $provider=$r.'Провайдер'; $time=[DateTimeOffset]::Parse($r.'Время UTC',$script:Invariant)
-        if ($provider -eq 'Microsoft-Windows-Security-Auditing' -and $id -in @(4608,4616)) { $created.Clear(); $opened.Clear(); $rdp.Clear(); $audit.Clear(); continue }
+        $ticks=$time.UtcDateTime.Ticks
+        $isSecurity=$provider -eq 'Microsoft-Windows-Security-Auditing'
+        # Boot markers: a log-service stop followed by a boot is a normal shutdown.
+        if (($isSecurity -and $id -eq 4608) -or ($provider -eq 'EventLog' -and $id -in @(6005,6006))) { $logStop=$null }
+        if ($isSecurity -and $id -in @(4608,4616)) { $created.Clear(); $opened.Clear(); $rdp.Clear(); $audit.Clear(); continue }
         # WMI correlation remains disabled as previously agreed. Raw Sysmon
         # 19/20/21 findings are retained for manual review.
         if ($provider -eq 'Microsoft-Windows-Sysmon') { continue }
-        if ($provider -eq 'Microsoft-Windows-Security-Auditing' -and $r.'Результат аудита' -ne (Ru-AuditOutcome 'Success')) { continue }
-        if ($provider -eq 'Microsoft-Windows-Security-Auditing') {
+        if ($provider -eq 'Microsoft-Windows-Eventlog' -and $id -eq 1100) { $logStop=$r; continue }
+        if ($null -ne $logStop -and $isSecurity) {
+            $gap=$ticks-[DateTimeOffset]::Parse($logStop.'Время UTC',$script:Invariant).UtcDateTime.Ticks
+            if ($gap -ge 0 -and $gap -le $windowTicks) {
+                Add-Triage -Groups $Groups -Priority $script:P2 -Scenario 'Журналирование остановлено без перезагрузки' -Evidence ('Связь: после 1100 (служба журнала остановлена) через '+[Math]::Round($gap/[TimeSpan]::TicksPerSecond)+' сек. записано событие '+$id+' без события загрузки 4608/6005.') -Why '' -Check 'Проверить, была ли перезагрузка (System.evtx: 6005/6006/6008, Kernel-General 12/13), кто остановил службу и что происходило в промежутке.' -Object ($logStop.'Record ID') -Rows @($logStop,$r)
+            }
+            $logStop=$null
+        }
+        if ($provider -eq 'Microsoft-Windows-Windows Defender') {
+            if ($id -in @(1006,1015,1116,1117)) { $lastThreat=$r; continue }
+            $weakened=$id -in @(5001,5010,5012)
+            if ($id -eq 5007) { $weakened=(Triage-DataValue $r @('New Value','NewValue')) -match '(?i)\\Exclusions\\|\\Disable\w+\s*=\s*0x0*1\b' }
+            if ($weakened -and $null -ne $lastThreat) {
+                $delta=($time-[DateTimeOffset]::Parse($lastThreat.'Время UTC',$script:Invariant)).TotalMinutes
+                if ($delta -ge 0 -and $delta -le [Math]::Max($TriageWindowMinutes,60)) {
+                    Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Обнаружение угрозы → отключение защиты' -Evidence ('Связь: обнаружение Defender, затем через '+[Math]::Round($delta,1)+' мин. ослабление защиты (событие '+$id+') на том же компьютере.') -Why '' -Check 'Проверить угрозу, кто отключил защиту или добавил исключение, и запускался ли обнаруженный объект.' -Object ((Triage-Value $lastThreat 'Имя угрозы')+' | '+$lastThreat.'Record ID') -Rows @($lastThreat,$r)
+                }
+            }
+            continue
+        }
+        if ($isSecurity -and $r.'Результат аудита' -ne (Ru-AuditOutcome 'Success')) { continue }
+        if ($isSecurity) {
             if ($id -eq 4720 -and (Triage-ValidSid $r.'SID целевой УЗ')) { $created[$r.'SID целевой УЗ']=$r }
             if ($id -in @(4722,4724) -and (Triage-ValidSid $r.'SID целевой УЗ')) { $opened[$r.'SID целевой УЗ']=$r }
+            if ($id -eq 4726 -and (Triage-ValidSid $r.'SID целевой УЗ') -and $created.ContainsKey($r.'SID целевой УЗ')) {
+                $start=$created[$r.'SID целевой УЗ']; $life=$ticks-[DateTimeOffset]::Parse($start.'Время UTC',$script:Invariant).UtcDateTime.Ticks
+                if ($life -ge 0 -and $life -le $dayTicks) {
+                    Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Временная УЗ: создана и удалена' -Evidence ('Строго: SID созданной и удаленной УЗ совпал; УЗ существовала '+(Format-Duration ($life/[TimeSpan]::TicksPerSecond))+'.') -Why '' -Check 'Установить, кто создал и удалил УЗ, и все действия этой УЗ между созданием и удалением (входы, RDP, службы, задания).' -Object ($r.'SID целевой УЗ'+' | '+$r.'Целевая УЗ') -Rows @($start,$r)
+                }
+            }
+            if ($id -eq 4740) {
+                $lockouts.Enqueue($r)
+                while ($lockouts.Count -gt 0 -and [DateTimeOffset]::Parse($lockouts.Peek().'Время UTC',$script:Invariant).UtcDateTime.Ticks -lt ($ticks-$failureWindowTicks)) { [void]$lockouts.Dequeue() }
+                $accounts=@($lockouts.ToArray() | ForEach-Object { ([string]$_.'Целевая УЗ').ToLowerInvariant() } | Select-Object -Unique)
+                if ($accounts.Count -ge $SprayUserThreshold -and ($lastLockoutAlert -eq 0 -or ($ticks-$lastLockoutAlert) -ge $failureWindowTicks)) {
+                    $lastLockoutAlert=$ticks
+                    Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Массовая блокировка УЗ' -Evidence ('Связь: заблокировано '+$accounts.Count+' разных УЗ за '+$WindowMinutes+' мин.') -Why '' -Check 'Найти источник блокировок (поле Caller Computer Name / рабочая станция в 4740 и отказы 4625/4771/4776), проверить его и сбросить пароли затронутых УЗ.' -Object ('Блокировки с '+[DateTimeOffset]::Parse($lockouts.Peek().'Время UTC',$script:Invariant).UtcDateTime.ToString('yyyy-MM-dd HH:mm',$script:Invariant)) -Rows $lockouts.ToArray()
+                }
+                continue
+            }
             if ($id -in @(4728,4732,4756) -and (Is-PrivilegedGroup $r.'SID целевой УЗ') -and $r.'SID участника' -and $created.ContainsKey($r.'SID участника')) {
                 $start=$created[$r.'SID участника']; $delta=($time-[DateTimeOffset]::Parse($start.'Время UTC',$script:Invariant)).TotalMinutes
                 if ($delta -gt 0 -and $delta -le $TriageWindowMinutes) {
-                    Add-Triage -Groups $Groups -Priority 'P1 — сначала' -Scenario 'Новая УЗ получила привилегии' -Evidence ('Строго: SID созданной УЗ совпал с SID участника группы; интервал до '+$TriageWindowMinutes+' мин.') -Why ('Строго: SID созданной УЗ совпал с SID участника группы; интервал до '+$TriageWindowMinutes+' мин.') -Check 'Проверить, согласованы ли создание и выдача прав. Это цепочка действий, не доказательство атаки.' -Object ($r.'SID участника'+' | '+$start.'Record ID') -Rows @($start,$r)
+                    Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Новая УЗ получила привилегии' -Evidence ('Строго: SID созданной УЗ совпал с SID участника группы; интервал до '+$TriageWindowMinutes+' мин.') -Why ('Строго: SID созданной УЗ совпал с SID участника группы; интервал до '+$TriageWindowMinutes+' мин.') -Check 'Проверить, согласованы ли создание и выдача прав. Это цепочка действий, не доказательство атаки.' -Object ($r.'SID участника'+' | '+$start.'Record ID') -Rows @($start,$r)
                 }
             }
             if ($id -in @(4634,4647)) {
@@ -1567,19 +1861,18 @@ function Add-ChainTriageCore($Groups,[object[]]$Rows) {
             $logon=Triage-LogonId $r 'Logon ID цели'
             if ($id -eq 4624 -and $r.'Тип входа' -eq '10' -and $logon) {
                 $rdp[$logon]=$r
-                if ((Triage-ValidSid $r.'SID целевой УЗ') -and $opened.ContainsKey($r.'SID целевой УЗ')) {
-                    $start=$opened[$r.'SID целевой УЗ']; $delta=($time-[DateTimeOffset]::Parse($start.'Время UTC',$script:Invariant)).TotalMinutes
+                $sid=$r.'SID целевой УЗ'
+                if ((Triage-ValidSid $sid) -and $opened.ContainsKey($sid)) {
+                    $start=$opened[$sid]; $delta=($time-[DateTimeOffset]::Parse($start.'Время UTC',$script:Invariant)).TotalMinutes
                     if ($delta -ge 0 -and $delta -le $TriageWindowMinutes) {
-                        Add-Triage -Groups $Groups -Priority 'P1 — сначала' -Scenario 'Включение/сброс УЗ → RDP-вход' -Evidence ('Строго: SID УЗ совпал; интервал до '+$TriageWindowMinutes+' мин.') -Why ('Строго: SID УЗ совпал; интервал до '+$TriageWindowMinutes+' мин.') -Check 'Проверить законность включения/сброса, владельца УЗ, источник RDP и последующие действия.' -Object ($r.'SID целевой УЗ'+' | '+$start.'Record ID') -Rows @($start,$r)
+                        Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Включение/сброс УЗ → RDP-вход' -Evidence ('Строго: SID УЗ совпал; интервал до '+$TriageWindowMinutes+' мин.') -Why ('Строго: SID УЗ совпал; интервал до '+$TriageWindowMinutes+' мин.') -Check 'Проверить законность включения/сброса, владельца УЗ, источник RDP и последующие действия.' -Object ($sid+' | '+$start.'Record ID') -Rows @($start,$r)
                     }
                 }
-            }
-            $impact=@{4697='создание службы';4698='создание задания';4702='изменение задания';4719='изменение политики аудита';4904='регистрация источника Security';4905='отмена источника Security';4906='изменение CrashOnAuditFail';4907='изменение параметров аудита объекта';4715='изменение SACL политики аудита';4739='изменение доменной политики';4946='добавление правила Firewall';4947='изменение правила Firewall';4948='удаление правила Firewall';4950='изменение параметра Firewall';4954='изменение Firewall через GPO';4720='создание УЗ';4722='включение УЗ';4723='изменение пароля';4724='сброс пароля';4728='добавление в глобальную группу';4732='добавление в локальную группу';4756='добавление в универсальную группу';4704='назначение права';4765='добавление SID History';4616='изменение времени'}
-            $actorLogon=Triage-LogonId $r 'Logon ID инициатора'
-            if ($impact.ContainsKey($id) -and $actorLogon -and $rdp.ContainsKey($actorLogon)) {
-                $start=$rdp[$actorLogon]; $delta=($time-[DateTimeOffset]::Parse($start.'Время UTC',$script:Invariant)).TotalMinutes
-                if ($delta -gt 0 -and $delta -le $TriageWindowMinutes -and (Triage-ValidSid $start.'SID целевой УЗ') -and $start.'SID целевой УЗ' -eq $r.'SID инициатора') {
-                    Add-Triage -Groups $Groups -Priority 'P1 — сначала' -Scenario ('RDP-сеанс: '+$impact[$id]) -Evidence ('Строго: успешный RDP типа 10 связан с действием по одному Logon ID и SID; интервал до '+$TriageWindowMinutes+' мин.') -Why ('Строго: успешный RDP типа 10 связан с действием по одному Logon ID и SID; интервал до '+$TriageWindowMinutes+' мин.') -Check 'Проверить источник RDP, владельца УЗ, объект изменения, заявку и полную временную линию сеанса.' -Object ($actorLogon+' | '+$id) -Rows @($start,$r)
+                if ((Triage-ValidSid $sid) -and $created.ContainsKey($sid)) {
+                    $start=$created[$sid]; $delta=($time-[DateTimeOffset]::Parse($start.'Время UTC',$script:Invariant)).TotalMinutes
+                    if ($delta -ge 0 -and $delta -le $TriageWindowMinutes) {
+                        Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Новая УЗ → RDP-вход' -Evidence ('Строго: SID созданной УЗ совпал с SID RDP-входа; интервал '+[Math]::Round($delta,1)+' мин.') -Why '' -Check 'Проверить, кто создал УЗ, источник RDP (IP) и действия в сеансе.' -Object ($sid+' | '+$start.'Record ID') -Rows @($start,$r)
+                    }
                 }
             }
             if ($id -in @(4719,4904,4905,4906,4907,4739,4715)) {
@@ -1587,12 +1880,23 @@ function Add-ChainTriageCore($Groups,[object[]]$Rows) {
                 if ($actor) { $audit[$actor]=$r }
             }
         }
+        # Action performed inside a live RDP session (same Logon ID and SID as 4624 type 10).
+        if ($script:RdpImpact.ContainsKey($id) -and ($isSecurity -or ($provider -eq 'Microsoft-Windows-Eventlog' -and $id -in @(104,1102)))) {
+            $actorLogon=Triage-LogonId $r 'Logon ID инициатора'
+            if ($actorLogon -and $rdp.ContainsKey($actorLogon)) {
+                $start=$rdp[$actorLogon]; $delta=($time-[DateTimeOffset]::Parse($start.'Время UTC',$script:Invariant)).TotalMinutes
+                if ($delta -gt 0 -and $delta -le $TriageWindowMinutes -and (Triage-ValidSid $start.'SID целевой УЗ') -and $start.'SID целевой УЗ' -eq $r.'SID инициатора') {
+                    $impact=$script:RdpImpact[$id]
+                    Add-Triage -Groups $Groups -Priority $script:P1 -Scenario ('RDP-сеанс: '+$impact[0]) -Evidence ('Строго: успешный RDP типа 10 связан с действием по одному Logon ID и SID; интервал до '+$TriageWindowMinutes+' мин.') -Why ('Строго: успешный RDP типа 10 связан с действием по одному Logon ID и SID; интервал до '+$TriageWindowMinutes+' мин.') -Check 'Проверить источник RDP, владельца УЗ, объект изменения, заявку и полную временную линию сеанса.' -Object ($actorLogon+' | '+$id) -Rows @($start,$r) -Score $impact[1] -Tactic 'Удаленный доступ → действие в сеансе' -Mitre 'T1021.001 Remote Desktop Protocol'
+                }
+            }
+        }
         if ($provider -eq 'Microsoft-Windows-Eventlog' -and $id -in @(104,1101,1102,1104,1108)) {
             $actor=Triage-ActorKey $r
             if ($actor -and $audit.ContainsKey($actor)) {
                 $start=$audit[$actor]; $delta=($time-[DateTimeOffset]::Parse($start.'Время UTC',$script:Invariant)).TotalMinutes
                 if ($delta -ge 0 -and $delta -le $TriageWindowMinutes) {
-                    Add-Triage -Groups $Groups -Priority 'P1 — сначала' -Scenario 'Изменение аудита → потеря/очистка журналирования' -Evidence ('Строго: одинаковые SID и Logon ID; интервал до '+$TriageWindowMinutes+' мин.') -Why ('Строго: одинаковые SID и Logon ID; интервал до '+$TriageWindowMinutes+' мин.') -Check 'Проверить точные параметры аудита, очищенный/переполненный журнал, инициатора, причину и внешнюю копию логов.' -Object ($actor+' | '+$start.'Record ID') -Rows @($start,$r)
+                    Add-Triage -Groups $Groups -Priority $script:P1 -Scenario 'Изменение аудита → потеря/очистка журналирования' -Evidence ('Строго: одинаковые SID и Logon ID; интервал до '+$TriageWindowMinutes+' мин.') -Why ('Строго: одинаковые SID и Logon ID; интервал до '+$TriageWindowMinutes+' мин.') -Check 'Проверить точные параметры аудита, очищенный/переполненный журнал, инициатора, причину и внешнюю копию логов.' -Object ($actor+' | '+$start.'Record ID') -Rows @($start,$r)
                 }
             }
         }
@@ -1601,8 +1905,10 @@ function Add-ChainTriageCore($Groups,[object[]]$Rows) {
 }
 function Test-TriageCandidate($r) {
     $id=[int]$r.'Event ID'; $provider=$r.'Провайдер'
-    if ($provider -eq 'Microsoft-Windows-Security-Auditing' -and $id -in @(4608,4616,4624,4625,4634,4647,4715,4697,4698,4702,4704,4719,4720,4722,4723,4724,4728,4732,4739,4756,4765,4904,4905,4906,4907,4946,4947,4948,4950,4954)) { return $true }
-    if ($provider -eq 'Microsoft-Windows-Eventlog' -and $id -in @(104,1101,1102,1104,1108)) { return $true }
+    if ($provider -eq 'Microsoft-Windows-Security-Auditing' -and $id -in @(4608,4616,4624,4625,4634,4647,4648,4715,4697,4698,4702,4704,4719,4720,4722,4723,4724,4726,4728,4732,4739,4740,4756,4765,4904,4905,4906,4907,4946,4947,4948,4950,4954)) { return $true }
+    if ($provider -eq 'Microsoft-Windows-Eventlog' -and $id -in @(104,1100,1101,1102,1104,1108)) { return $true }
+    if ($provider -eq 'EventLog' -and $id -in @(6005,6006)) { return $true }
+    if ($provider -eq 'Microsoft-Windows-Windows Defender' -and $id -in @(1006,1015,1116,1117,5001,5007,5010,5012)) { return $true }
     return $false
 }
 function Build-LogCoverage([string]$WorkPath) {
@@ -1635,33 +1941,154 @@ function Build-LogCoverage([string]$WorkPath) {
         }
     } finally { Close-Writer $w }
 }
+function Format-UtcText([string]$Iso) {
+    if (-not $Iso) { return '' }
+    try { return [DateTimeOffset]::Parse($Iso,$script:Invariant).UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss',$script:Invariant) } catch { return $Iso }
+}
+function Format-LocalText([string]$Iso) {
+    if (-not $Iso) { return '' }
+    try { return [TimeZoneInfo]::ConvertTimeFromUtc([DateTimeOffset]::Parse($Iso,$script:Invariant).UtcDateTime,$script:DisplayTz).ToString('yyyy-MM-dd HH:mm:ss',$script:Invariant) } catch { return '' }
+}
+function Get-IsoTicks([string]$Iso) {
+    if (-not $Iso) { return [long]0 }
+    return [DateTimeOffset]::Parse($Iso,$script:Invariant).UtcDateTime.Ticks
+}
+function Build-Incidents($Groups) {
+    # Incident = priority rows of one folder+computer whose time ranges are within
+    # -IncidentGapHours of each other. Several different scenarios on one host in a
+    # short time are typical of an attack chain, so such incidents are escalated.
+    $gapTicks=[long]$IncidentGapHours*[TimeSpan]::TicksPerHour
+    $incidents=New-Object 'System.Collections.Generic.List[object]'
+    $byScope=@{}
+    foreach ($g in @($Groups.Values)) {
+        $scope=($g.Scope+'|'+$g.Computer).ToLowerInvariant()
+        if (-not $byScope.ContainsKey($scope)) { $byScope[$scope]=New-Object 'System.Collections.Generic.List[object]' }
+        $byScope[$scope].Add($g)
+    }
+    foreach ($scope in ($byScope.Keys | Sort-Object)) {
+        $current=$null
+        foreach ($g in ($byScope[$scope] | Sort-Object @{Expression={Get-IsoTicks $_.First}},Scenario)) {
+            $first=Get-IsoTicks $g.First; $last=Get-IsoTicks $g.Last
+            if ($null -eq $current -or $first -gt ($current.LastTicks+$gapTicks)) {
+                $current=[pscustomobject]@{Id='';Groups=(New-Object 'System.Collections.Generic.List[object]');FirstTicks=$first;LastTicks=$last;First=$g.First;Last=$g.Last;Computer=$g.Computer;Scope=$g.Scope;Score=0;Priority=$script:P3;Chain=$false}
+                $incidents.Add($current)
+            }
+            $current.Groups.Add($g)
+            if ($last -gt $current.LastTicks) { $current.LastTicks=$last; $current.Last=$g.Last }
+        }
+    }
+    foreach ($inc in $incidents) {
+        $max=0; $tactics=New-Object 'System.Collections.Generic.HashSet[string]'; $significant=0
+        foreach ($g in $inc.Groups) {
+            if ($g.Score -gt $max) { $max=$g.Score }
+            if ($g.Score -ge 50) { $significant++; if ($g.Tactic) { [void]$tactics.Add($g.Tactic) } }
+        }
+        $score=$max
+        # Two or more significant scenarios from different tactics on one host = probable chain.
+        if ($significant -ge 2 -and $tactics.Count -ge 2) { $score=[Math]::Min(100,[Math]::Max($max,80)+5*($tactics.Count-1)); $inc.Chain=$true }
+        $inc.Score=$score; $inc.Priority=Get-PriorityFromScore $score
+    }
+    $n=0
+    foreach ($inc in ($incidents | Sort-Object @{Expression={$_.Score};Descending=$true},@{Expression={$_.FirstTicks}})) {
+        $n++; $inc.Id=('КИ-{0:D3}' -f $n)
+        foreach ($g in $inc.Groups) { $g.Incident=$inc.Id }
+    }
+    return ,@($incidents | Sort-Object Id)
+}
+function Write-IncidentReport([string]$WorkPath,$Incidents) {
+    $w=New-Writer (Join-Path $WorkPath 'Incidents.csv')
+    try {
+        Write-Row $w @('КИ','Приоритет','Оценка риска','Компьютер','Начало UTC','Конец UTC','Начало (местное)','Длительность','Сценариев','Цепочка атаки','Этапы (тактики)','Хронология','Учетные записи','IP источников','Event ID','Папка источника','Что делать')
+        foreach ($inc in $Incidents) {
+            $ordered=@($inc.Groups | Sort-Object @{Expression={Get-IsoTicks $_.First}},Scenario)
+            $timeline=New-Object 'System.Collections.Generic.List[string]'
+            $tactics=New-Object 'System.Collections.Generic.List[string]'
+            $accounts=New-Object 'System.Collections.Generic.List[string]'; $ips=New-Object 'System.Collections.Generic.List[string]'
+            $ids=New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($g in $ordered) {
+                if ($timeline.Count -lt 20) { $timeline.Add(((Format-UtcText $g.First)+' ['+$g.Priority.Substring(0,2)+'] '+$g.Scenario)) }
+                if ($g.Tactic -and -not $tactics.Contains($g.Tactic)) { $tactics.Add($g.Tactic) }
+                foreach ($a in $g.Accounts) { if ($accounts.Count -lt 10 -and -not $accounts.Contains($a)) { $accounts.Add($a) } }
+                foreach ($ip in $g.Ips) { if ($ips.Count -lt 10 -and -not $ips.Contains($ip)) { $ips.Add($ip) } }
+                foreach ($i in $g.Ids) { [void]$ids.Add($i) }
+            }
+            if ($ordered.Count -gt 20) { $timeline.Add('… еще '+($ordered.Count-20)+' строк на листе Приоритетные') }
+            $chain=''; if ($inc.Chain) { $chain='Да: несколько значимых сценариев разных тактик на одном компьютере' }
+            $todo='Отфильтровать лист «Приоритетные» по столбцу КИ = '+$inc.Id+' и пройти строки по времени.'
+            if ($inc.Priority -eq $script:P1) { $todo='Срочно: '+$todo+' Подтвердить или опровергнуть; при подтверждении — изолировать компьютер, сменить пароли затронутых УЗ, сохранить журналы.' }
+            $duration=Format-Duration (($inc.LastTicks-$inc.FirstTicks)/[TimeSpan]::TicksPerSecond)
+            Write-Row $w @($inc.Id,$inc.Priority,$inc.Score,$inc.Computer,(Format-UtcText $inc.First),(Format-UtcText $inc.Last),(Format-LocalText $inc.First),$duration,$ordered.Count,$chain,
+                ($tactics.ToArray() -join ' → '),($timeline.ToArray() -join ' → '),($accounts.ToArray() -join ' | '),($ips.ToArray() -join ' | '),
+                ((@($ids) | Sort-Object {[int]$_}) -join ', '),$inc.Scope,$todo)
+        }
+    } finally { Close-Writer $w }
+}
 function Write-TriageReport([string]$WorkPath,$Groups,[int]$ScopeCount,[int]$BlockedCount,[int]$RowFailures,[int]$ChainFailures,[string]$BuildNote) {
     # Writing the report is isolated from correlation.  Thus a malformed
     # individual record can never remove the entire "Приоритетные" sheet.
+    $incidents=@()
+    try { $incidents=Build-Incidents $Groups; Write-IncidentReport $WorkPath $incidents }
+    catch { Log-Issue 'Triage' $WorkPath '' ('Не сформирован лист Инциденты: '+(Get-TriageErrorText $_)) }
     $w=New-Writer (Join-Path $WorkPath 'Triage.csv')
     try {
-        Write-Row $w @('Приоритет','Event ID','Сценарий','Основание связи','Почему выделено','Что проверить','Компьютер','УЗ / объект / IP','Первое время UTC','Последнее время UTC','Связанных уникальных событий','Ссылки на находки и EVTX (до 10)','Папка источника','Ограничения')
-        foreach ($g in (@($Groups.Values) | Sort-Object -Property @('Priority','Scenario','Computer','First'))) {
+        Write-Row $w @('КИ','Приоритет','Оценка риска','Первое время UTC','Последнее время UTC','Первое время (местное)','Компьютер','Сценарий','Тактика','MITRE ATT&CK','Учетные записи','IP источника','УЗ / объект / IP','Основание связи','Почему выделено','Что проверить','Event ID','Связанных уникальных событий','Ссылки на находки и EVTX (до 10)','Папка источника','Ограничения')
+        foreach ($g in (@($Groups.Values) | Sort-Object @{Expression={$_.Score};Descending=$true},@{Expression={$_.Incident}},@{Expression={$_.First}},Scenario)) {
             $note='Кандидат для проверки, не подтвержденный инцидент. Повторы объединены; диапазон времени не является длительностью атаки.'
             if ($g.Recovered) { $note+=' Есть восстановленный XML: перепроверить исходную запись.' }
             $ids=@($g.Ids | Sort-Object {[int]$_}) -join ', '
-            Write-Row $w @($g.Priority,$ids,$g.Scenario,$g.Evidence,$g.Why,$g.Check,$g.Computer,$g.Object,$g.First,$g.Last,[int]($g.Seen.Count),($g.Refs.ToArray() -join ' || '),$g.Scope,$note)
+            $count=[long]$g.Seen.Count; if ($g.EventCount -gt $count) { $count=$g.EventCount }
+            Write-Row $w @($g.Incident,$g.Priority,$g.Score,(Format-UtcText $g.First),(Format-UtcText $g.Last),(Format-LocalText $g.First),$g.Computer,$g.Scenario,$g.Tactic,$g.Mitre,
+                ($g.Accounts.ToArray() -join ' | '),($g.Ips.ToArray() -join ' | '),$g.Object,$g.Evidence,$g.Why,$g.Check,$ids,$count,($g.Refs.ToArray() -join ' || '),$g.Scope,$note)
         }
         $limits=New-Object 'System.Collections.Generic.List[string]'
         if ($RowFailures -gt 0) { [void]$limits.Add('Строк с ошибкой приоритизации: '+$RowFailures+'. Они перечислены на листе Ошибки (этап «Приоритизация: строка»).') }
         if ($ChainFailures -gt 0) { [void]$limits.Add('Областей со сбойной связкой: '+$ChainFailures+'. Остальные области обработаны.') }
         if ($BuildNote) { [void]$limits.Add($BuildNote) }
         if ($limits.Count -gt 0) {
-            Write-Row $w @('Справка','','Приоритизация выполнена с ограничениями',($limits.ToArray() -join ' '),'Это не отменяет уже сформированные P1/P2; проверить лист Ошибки и исходный EVTX.','После устранения причины повторить запуск на неизменяемой копии.','','','','','','','',$null)
+            Write-Row $w @('','Справка','','','','','','Приоритизация выполнена с ограничениями','','','','','',($limits.ToArray() -join ' '),'Это не отменяет уже сформированные строки; проверить лист Ошибки и исходный EVTX.','После устранения причины повторить запуск на неизменяемой копии.','','','','',$null)
         }
-        Write-Row $w @('Справка','','Границы анализа','Связки не строятся через ошибки чтения, восстановленный XML, изменение времени/загрузку ОС и между разными папками либо компьютерами.','Обычные 4672, одиночные отказы входа и системные ошибки автоматически сюда не включаются.','Также просмотреть листы Подбор_пароля, Качество_выгрузки, Файлы и Ошибки.','','','','','','','',('Областей с кандидатами цепочек: '+$ScopeCount+'; областей с запретом цепочек: '+$BlockedCount+'. Окно цепочек: '+$TriageWindowMinutes+' мин.; окно отказов: '+$WindowMinutes+' мин.'))
+        Write-Row $w @('','Справка','','','','','','Границы анализа','','','','','','Связки не строятся через ошибки чтения, восстановленный XML, изменение времени/загрузку ОС и между разными папками либо компьютерами.','Оценка риска: P1 ≥ 80, P2 ≥ 50, P3 — к сведению. Одиночные отказы входа и обычные системные ошибки сюда не включаются.','Также просмотреть листы Инциденты, Подбор_пароля, RDP_итоги, Качество_выгрузки и Ошибки.','','','','',('Областей с кандидатами цепочек: '+$ScopeCount+'; областей с запретом цепочек: '+$BlockedCount+'. Окно цепочек: '+$TriageWindowMinutes+' мин.; окно отказов: '+$WindowMinutes+' мин.; объединение в КИ: '+$IncidentGapHours+' ч.'))
     } finally { Close-Writer $w }
+}
+function Add-BurstTriage($Groups,[string]$WorkPath) {
+    # Password guessing / spraying windows from the AuthBursts sheet become priority rows.
+    $path=Join-Path $WorkPath 'AuthBursts.csv'
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $n=0
+    foreach ($b in (Import-Csv -LiteralPath $path -Delimiter $Delimiter -Encoding UTF8)) {
+        $n++
+        $spray=$b.'Событие' -match 'spraying'
+        $source=$b.'Источник'
+        $refs=[string]$b.'Файлы и Record ID (пример)'
+        $firstRef=($refs -split ' \| ')[0]
+        $row=[pscustomobject]@{'Номер'=$b.'Номера находок (пример)';'Event ID'=$b.'Event ID';'Record ID'=($firstRef -replace '^.*#','');'Время UTC'=$b.'Окно: начало UTC';
+            'Папка источника'=$b.'Папка источника';'Полный путь'=($firstRef -replace '#[^#]*$','');'Компьютер'=$b.'Компьютер';'Целевая УЗ'=$b.'Учетные записи';
+            'IP источника'=$source;'SHA256 XML события'=('burst|'+$n+'|'+$b.'Окно: начало UTC'+'|'+$source);'Восстановление XML'=''}
+        $scenario='Подбор пароля к УЗ'; $object=$source+' → '+$b.'Учетные записи'
+        if ($spray) { $scenario='Password spraying с одного источника'; $object=$source }
+        $score=$script:ScenarioCatalog[$scenario].Score
+        $public=Triage-IsPublicIp $source
+        if ($public) { $score+=10 }
+        # Kerberos/NTLM bursts for one account from an internal host are usually a stale saved password.
+        elseif (-not $spray -and $b.'Event ID' -in @('4771','4776')) { $score=45 }
+        $evidence='Связь: '+$b.'Событий в окне'+' отказов (Event ID '+$b.'Event ID'+') за '+$WindowMinutes+' мин. с источника '+$source+'; разных УЗ: '+$b.'Разных УЗ'+'. Коды: '+$b.'Коды статуса'+'.'
+        if ($public) { $evidence+=' Источник — публичный IP.' }
+        Add-Triage -Groups $Groups -Priority $script:P2 -Scenario $scenario -Evidence $evidence -Why '' -Check 'Проверить источник (владелец IP/узла), коды отказов (0xC000006A — неверный пароль, 0xC0000064 — нет такой УЗ), был ли успешный вход с этого источника после серии, и блокировки 4740.' -Object $object -Rows @($row) -Score $score -LastTime $b.'Окно: конец UTC' -EventCount ([long]$b.'Событий в окне')
+    }
 }
 function Write-TriageFallback([string]$WorkPath,[string]$Reason) {
     $emptyGroups=@{}
     Write-TriageReport $WorkPath $emptyGroups 0 0 0 0 ('Не удалось полностью сформировать приоритеты: '+$Reason)
 }
-$script:TriageColumns=@('Номер','Event ID','Record ID','Время UTC','Папка источника','Полный путь','Компьютер','Провайдер','Результат аудита','SID целевой УЗ','SID участника','SID инициатора','Logon ID цели','Logon ID инициатора','Тип входа','Целевая УЗ','IP источника','Status','SubStatus','Данные события','Командная строка','Процесс','SHA256 XML события','Восстановление XML')
+# Provider|Event ID pairs that Add-SingleTriage can act on; other rows skip the call.
+$script:SingleTriageKeys=New-Object 'System.Collections.Generic.HashSet[string]'
+foreach ($k in @('Microsoft-Windows-Eventlog|104','Microsoft-Windows-Eventlog|1102','Microsoft-Windows-Eventlog|1101','Microsoft-Windows-Eventlog|1104','Microsoft-Windows-Eventlog|1108',
+    'Service Control Manager|7045','Service Control Manager|7040','Service Control Manager|7031','Service Control Manager|7034',
+    'Microsoft-Windows-TaskScheduler|106','Microsoft-Windows-TaskScheduler|140','Microsoft-Windows-Sysmon|16','Microsoft-Windows-Sysmon|25',
+    'Microsoft-Windows-TerminalServices-RemoteConnectionManager|1149')) { [void]$script:SingleTriageKeys.Add($k) }
+foreach ($i in @(4616,4624,4697,4698,4702,4704,4715,4717,4719,4728,4732,4739,4756,4765,4766,4904,4905,4906,4907,4946)) { [void]$script:SingleTriageKeys.Add('Microsoft-Windows-Security-Auditing|'+$i) }
+foreach ($i in @(1006,1008,1015,1116,1118,1119,1121,5001,5007,5010,5012,5013)) { [void]$script:SingleTriageKeys.Add('Microsoft-Windows-Windows Defender|'+$i) }
+$script:TriageColumns=@('Номер','Event ID','Record ID','Время UTC','Папка источника','Полный путь','Компьютер','Провайдер','Результат аудита','SID целевой УЗ','SID участника','SID инициатора','Logon ID цели','Logon ID инициатора','Тип входа','Целевая УЗ','IP источника','Status','SubStatus','Данные события','Командная строка','Процесс','SHA256 XML события','Восстановление XML','Инициатор','Имя угрозы')
 function Build-Triage([string]$WorkPath) {
     $script:TriageIncomplete=$false
     $script:TriageHasErrors=$false
@@ -1672,7 +2099,7 @@ function Build-Triage([string]$WorkPath) {
             Import-Csv -LiteralPath $file.FullName -Delimiter $Delimiter -Encoding UTF8 | ForEach-Object {
                 $r=$_
                 try {
-                    Add-SingleTriage $groups $r
+                    if ($script:SingleTriageKeys.Contains($r.'Провайдер'+'|'+$r.'Event ID') -or (Triage-Value $r 'Правило') -in @('AV-VENDOR-THREAT','HEURISTIC-COMMAND')) { Add-SingleTriage $groups $r }
                     if (Test-TriageCandidate $r) {
                         $scope=Triage-Scope $r
                         $sourcePath=Triage-Value $r 'Полный путь'
@@ -1703,6 +2130,14 @@ function Build-Triage([string]$WorkPath) {
     } catch {
         $script:TriageIncomplete=$true; $script:TriageHasErrors=$true; $buildNote=Get-TriageErrorText $_
         Log-Issue 'Triage' $WorkPath '' $buildNote
+    }
+    try { Add-BurstTriage $groups $WorkPath }
+    catch {
+        $script:TriageIncomplete=$true; $script:TriageHasErrors=$true
+        $errorText=Get-TriageErrorText $_
+        if ($buildNote) { $buildNote+=' | ' }
+        $buildNote+='Не удалось перенести серии подбора пароля: '+$errorText
+        Log-Issue 'Triage' $WorkPath '' $errorText
     }
     try {
         $script:ErrorWriter.Flush()
@@ -2101,6 +2536,157 @@ function Test-V92Parse {
     try { $null=Parse-Event ((Test-Xml 1000 'Application Error' '<EventData><Data Name="V">ok</Data></EventData>').Replace('</EventData>','')) } catch { $rejected=$true }
     Assert-True $rejected 'v9.2 malformed XML still rejected'
 }
+function Test-V92Triage {
+    $sec='Microsoft-Windows-Security-Auditing'
+    Assert-True ((Triage-IsPublicIp '45.10.20.30') -and (Triage-IsPublicIp '::ffff:8.8.8.8') -and (Triage-IsPublicIp '2a00:1450::1')) 'v9.2 public IP detection'
+    Assert-True (-not (Triage-IsPublicIp '10.1.2.3') -and -not (Triage-IsPublicIp '172.20.0.1') -and -not (Triage-IsPublicIp '192.168.1.1') -and -not (Triage-IsPublicIp '100.64.0.1') -and -not (Triage-IsPublicIp '192.0.2.5') -and -not (Triage-IsPublicIp 'fe80::1') -and -not (Triage-IsPublicIp 'LOCAL') -and -not (Triage-IsPublicIp '-')) 'v9.2 private/reserved IP not public'
+    $alice='S-1-5-21-1-2-3-1001'; $backdoor='S-1-5-21-1-2-3-2001'; $ip='45.10.20.30'
+    $mk={ param([int]$Id,[string]$Provider,[string]$Time,[int]$Record,[hashtable]$Values)
+        $v=@{'Правило'='';'Компьютер'='PC01'}; foreach ($k in $Values.Keys) { $v[$k]=$Values[$k] }
+        return New-V7TestRow $Id $Provider $Time ([string]$Record) $v }
+    $rows=New-Object 'System.Collections.Generic.List[object]'
+    for ($i=0;$i -lt $FailureThreshold;$i++) {
+        $rows.Add((& $mk 4625 $sec ('2026-01-01T10:00:{0:D2}.0000000Z' -f $i) (100+$i) @{'Результат аудита'='Отказ';'Тип входа'='10';'IP источника'=$ip;'SubStatus'='0xc000006a';'SID целевой УЗ'='S-1-0-0'}))
+    }
+    $rows.Add((& $mk 4624 $sec '2026-01-01T10:01:00.0000000Z' 200 @{'Тип входа'='10';'IP источника'=$ip;'Logon ID цели'='0xa1';'SID целевой УЗ'=$alice}))
+    $actor=@{'SID инициатора'=$alice;'Logon ID инициатора'='0xa1';'Инициатор'='LAB\alice'}
+    $v=@{'SID целевой УЗ'=$backdoor;'Целевая УЗ'='PC01\backdoor'}; foreach ($k in $actor.Keys) { $v[$k]=$actor[$k] }
+    $rows.Add((& $mk 4720 $sec '2026-01-01T10:05:00.0000000Z' 201 $v))
+    $v=@{'SID целевой УЗ'='S-1-5-32-544';'SID участника'=$backdoor;'Целевая УЗ'='Administrators'}; foreach ($k in $actor.Keys) { $v[$k]=$actor[$k] }
+    $rows.Add((& $mk 4732 $sec '2026-01-01T10:06:00.0000000Z' 202 $v))
+    $rows.Add((& $mk 7045 'Service Control Manager' '2026-01-01T10:10:00.0000000Z' 203 @{'Данные события'='ServiceName=BTOBTO | ImagePath=%COMSPEC% /Q /c echo whoami ^> \\127.0.0.1\C$\__output 2^>^&1 | ServiceType=user mode service | StartType=demand start | AccountName=LocalSystem'}))
+    $rows.Add((& $mk 1116 'Microsoft-Windows-Windows Defender' '2026-01-01T10:12:00.0000000Z' 204 @{'Имя угрозы'='HackTool:Win32/Mimikatz';'Ресурс / путь'='C:\Users\Public\m.exe'}))
+    $rows.Add((& $mk 5001 'Microsoft-Windows-Windows Defender' '2026-01-01T10:15:00.0000000Z' 205 @{}))
+    $rows.Add((& $mk 5007 'Microsoft-Windows-Windows Defender' '2026-01-01T10:16:00.0000000Z' 206 @{'Данные события'='Old Value= | New Value=HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths\C:\Users\Public = 0x0'}))
+    $rows.Add((& $mk 7040 'Service Control Manager' '2026-01-01T10:17:00.0000000Z' 207 @{'Данные события'='param1=Антивирусная программа Microsoft Defender | param2=Автоматически | param3=Отключена | param4=WinDefend'}))
+    $v=@{'SID целевой УЗ'=$backdoor;'Целевая УЗ'='PC01\backdoor'}; foreach ($k in $actor.Keys) { $v[$k]=$actor[$k] }
+    $rows.Add((& $mk 4726 $sec '2026-01-01T10:18:00.0000000Z' 208 $v))
+    $rows.Add((& $mk 1102 'Microsoft-Windows-Eventlog' '2026-01-01T10:20:00.0000000Z' 209 $actor))
+    # Benign computer: internal RDP, ordinary group change, own password change.
+    $rows.Add((& $mk 4624 $sec '2026-01-01T09:00:00.0000000Z' 300 @{'Компьютер'='PC02';'Тип входа'='10';'IP источника'='10.0.0.5';'Logon ID цели'='0xb2'}))
+    $rows.Add((& $mk 4732 $sec '2026-01-01T09:05:00.0000000Z' 301 @{'Компьютер'='PC02';'SID целевой УЗ'='S-1-5-32-545';'SID участника'=$alice}))
+    $tmp=Join-Path ([IO.Path]::GetTempPath()) ('EvtxAudit-V92-'+[guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($tmp)
+    $script:IssueCount=0; $script:WarningCount=0
+    try {
+        $rows | Export-Csv -LiteralPath (Join-Path $tmp 'Findings-0001.csv') -Delimiter $Delimiter -Encoding UTF8 -NoTypeInformation
+        $bw=New-Writer (Join-Path $tmp 'AuthBursts.csv')
+        Write-Row $bw @('Приоритет','Event ID','Событие','Папка источника','Компьютер','Источник','Окно: начало UTC','Окно: конец UTC','Событий в окне','Разных УЗ','Учетные записи','Номера находок (пример)','Файлы и Record ID (пример)','Коды статуса','Комментарий')
+        Write-Row $bw @('Высокий','4625','Отказы для нескольких УЗ с одного источника: возможный password spraying','C:\test','PC01',$ip,'2026-01-01T09:50:00.0000000Z','2026-01-01T09:58:00.0000000Z','25','8','LAB\a | LAB\b | LAB\c','1 | 2','C:\test\Security.evtx#11 | C:\test\Security.evtx#12','0xc000006d/0xc0000064','x')
+        Close-Writer $bw
+        $script:ErrorWriter=New-Writer (Join-Path $tmp 'Errors.csv')
+        Write-Row $script:ErrorWriter @('Время UTC','Этап','Файл источника','Record ID','Ошибка')
+        Build-Triage $tmp
+        $script:ErrorWriter.Flush()
+        Assert-True (-not $script:TriageHasErrors) 'v9.2 attack scenario: triage without errors'
+        $out=@(Import-Csv -LiteralPath (Join-Path $tmp 'Triage.csv') -Delimiter $Delimiter -Encoding UTF8 | Where-Object { $_.'Приоритет' -ne 'Справка' })
+        $scenarios=@($out | ForEach-Object { $_.'Сценарий' })
+        foreach ($expected in @('Password spraying с одного источника','Отказы RDP с неверным паролем → успешный вход','RDP-вход с внешнего IP','RDP-сеанс: создание УЗ',
+            'Новая УЗ получила привилегии','Добавление в привилегированную группу','Служба удаленного выполнения (PsExec/Impacket)','Обнаружение угрозы Defender',
+            'Отключение компонентов защиты Defender','Обнаружение угрозы → отключение защиты','Добавлено исключение Defender','Отключение службы защиты или журналирования',
+            'Временная УЗ: создана и удалена','Очистка журнала','RDP-сеанс: очистка журнала Security')) {
+            Assert-True ($expected -in $scenarios) ('v9.2 attack scenario detected: '+$expected)
+        }
+        Assert-True (@($out | Where-Object { $_.'Компьютер' -eq 'PC02' }).Count -eq 0) 'v9.2 benign computer has no priority rows'
+        $scores=@($out | ForEach-Object { [int]$_.'Оценка риска' })
+        $sorted=$true; for ($i=1;$i -lt $scores.Count;$i++) { if ($scores[$i] -gt $scores[$i-1]) { $sorted=$false } }
+        Assert-True ($sorted -and $scores[0] -ge 90) 'v9.2 priority sheet sorted by risk score'
+        $spray=@($out | Where-Object { $_.'Сценарий' -eq 'Password spraying с одного источника' })[0]
+        Assert-True ($spray.'Связанных уникальных событий' -eq '25' -and [int]$spray.'Оценка риска' -eq 90 -and $spray.'IP источника' -eq $ip -and $spray.'Последнее время UTC' -eq '2026-01-01 09:58:00') 'v9.2 spraying window: count, public-IP boost, IP and end time'
+        $p1=@($out | Where-Object { $_.'Сценарий' -eq 'Служба удаленного выполнения (PsExec/Impacket)' })[0]
+        Assert-True ($p1.'Приоритет' -eq $script:P1 -and $p1.'MITRE ATT&CK' -like 'T1569.002*' -and $p1.'Тактика' -and $p1.'Почему выделено' -notlike 'Факт:*') 'v9.2 catalog fills priority, MITRE, tactic and why'
+        $inc=@(Import-Csv -LiteralPath (Join-Path $tmp 'Incidents.csv') -Delimiter $Delimiter -Encoding UTF8)
+        Assert-True ($inc.Count -eq 1 -and $inc[0].'КИ' -eq 'КИ-001' -and $inc[0].'Приоритет' -eq $script:P1 -and $inc[0].'Цепочка атаки' -like 'Да*' -and [int]$inc[0].'Оценка риска' -ge 95) 'v9.2 one P1 incident with attack chain'
+        Assert-True ($inc[0].'Хронология' -like '2026-01-01 09:50:00 `[P1`] Password spraying*' -and $inc[0].'IP источников' -like "*$ip*" -and $inc[0].'Учетные записи' -like '*backdoor*') 'v9.2 incident timeline, IPs and accounts'
+        Assert-True (@($out | Where-Object { $_.'КИ' -ne 'КИ-001' }).Count -eq 0) 'v9.2 every priority row linked to its incident'
+        $plan=Get-ExcelSheetPlan $tmp
+        $names=@($plan | ForEach-Object { $_.Name })
+        Assert-True ($names[0] -eq 'Инциденты' -and $names[1] -eq 'Приоритетные' -and $names[2] -eq 'Подбор_пароля') 'v9.2 Excel sheet order'
+        $triagePlan=$plan[1]
+        $scoreIndex=[array]::IndexOf([string[]]$triagePlan.Headers,'Оценка риска')
+        Assert-True ($triagePlan.Types[$scoreIndex] -eq 1 -and $triagePlan.Types[[array]::IndexOf([string[]]$triagePlan.Headers,'Event ID')] -eq 2 -and $triagePlan.PriorityColumn -eq 2 -and $triagePlan.Wrap.Count -ge 4) 'v9.2 Excel plan: numeric score, text IDs, priority colors, wrapping'
+        $findPlan=@($plan | Where-Object { $_.Kind -eq 'Findings' })[0]
+        Assert-True ($findPlan.Hidden -contains ([array]::IndexOf([string[]]$findPlan.Headers,'SHA256 XML события')+1)) 'v9.2 Excel plan hides technical finding columns'
+        Assert-True ((Get-ColumnLetter 1) -eq 'A' -and (Get-ColumnLetter 26) -eq 'Z' -and (Get-ColumnLetter 27) -eq 'AA' -and (Get-ColumnLetter 46) -eq 'AT') 'v9.2 Excel column letters'
+        New-FallbackOverview $tmp (Join-Path $tmp 'overview.csv')
+        $overview=@(Import-Csv -LiteralPath (Join-Path $tmp 'overview.csv') -Delimiter $Delimiter -Encoding UTF8)
+        Assert-True ($overview[0].'Тип строки' -eq 'Инцидент КИ-001' -and @($overview | Where-Object { $_.'Тип строки' -like 'Приоритетная находка КИ-*' }).Count -eq $out.Count) 'v9.2 CSV fallback starts with incidents'
+    } finally {
+        Close-Writer $script:ErrorWriter
+        Remove-Item -LiteralPath $tmp -Recurse -Force
+    }
+    if (-not $IncludeNoise) {
+        $e=Parse-Event (Test-Xml 4672 $sec '<EventData><Data Name="SubjectUserSid">S-1-5-21-1-2-3-1500</Data><Data Name="SubjectUserName">DC01$</Data></EventData>')
+        Assert-True ($null -eq (Match-Event $e $false)) 'v9.2 4672 of computer account filtered'
+        Assert-True (-not $script:Rules.ContainsKey('Microsoft-Windows-Security-Auditing|4723') -and -not $script:Rules.ContainsKey('Microsoft-Windows-Security-Auditing|4946')) 'v9.2 4723 and firewall rule events are noise'
+    }
+}
+function Test-V92Pipeline {
+    if ($MaxEventId -lt 7045) { Write-Host 'v9.2 pipeline test skipped: -MaxEventId excludes fixture events'; return }
+    # Real code path except the EVTX reader: XML -> Parse-Event -> Match-Event -> Save-Finding /
+    # Save-Failure -> Correlate-Failures -> Build-Triage. Verifies column wiring end to end.
+    $sec='Microsoft-Windows-Security-Auditing'; $ns='http://schemas.microsoft.com/win/2004/08/events/event'
+    $alice='S-1-5-21-1-2-3-1001'; $backdoor='S-1-5-21-1-2-3-2001'; $ip='45.10.20.30'
+    $rid=0
+    $xml={ param([int]$Id,[string]$Provider,[string]$Time,[string]$Payload,[string]$Keywords='0x8020000000000000',[string]$Channel='Security')
+        $script:V92Rid++
+        return "<Event xmlns='$ns'><System><Provider Name='$Provider'/><EventID>$Id</EventID><Level>0</Level><Keywords>$Keywords</Keywords><TimeCreated SystemTime='$Time'/><EventRecordID>$($script:V92Rid)</EventRecordID><Channel>$Channel</Channel><Computer>WS01.lab.local</Computer></System>$Payload</Event>" }
+    $d={ param([hashtable]$H) $sb='<EventData>'; foreach ($k in $H.Keys) { $sb+="<Data Name='$k'>"+[Security.SecurityElement]::Escape([string]$H[$k])+'</Data>' }; return $sb+'</EventData>' }
+    $script:V92Rid=0
+    $events=New-Object 'System.Collections.Generic.List[string]'
+    $users=@('alice','alice','alice','alice','alice','alice','alice','alice','alice','alice','bob','carol','dave','erin','frank','admin')
+    for ($i=0; $i -lt $users.Count; $i++) {
+        $events.Add((& $xml 4625 $sec ('2026-02-01T10:00:{0:D2}.0000000Z' -f $i) (& $d ([ordered]@{SubjectUserSid='S-1-5-18';TargetUserSid='S-1-0-0';TargetUserName=$users[$i];TargetDomainName='LAB';Status='0xc000006d';SubStatus='0xc000006a';LogonType='10';IpAddress=$ip;IpPort='0'})) '0x8010000000000000'))
+    }
+    $events.Add((& $xml 4624 $sec '2026-02-01T10:01:00.0000000Z' (& $d ([ordered]@{TargetUserSid=$alice;TargetUserName='alice';TargetDomainName='LAB';TargetLogonId='0xa1';LogonType='10';IpAddress=$ip}))))
+    $events.Add((& $xml 4672 $sec '2026-02-01T10:01:00.0000000Z' (& $d ([ordered]@{SubjectUserSid='S-1-5-21-1-2-3-1500';SubjectUserName='WS01$';SubjectDomainName='LAB';PrivilegeList='SeDebugPrivilege'}))))
+    $events.Add((& $xml 4720 $sec '2026-02-01T10:05:00.0000000Z' (& $d ([ordered]@{TargetSid=$backdoor;TargetUserName='backdoor';TargetDomainName='WS01';SubjectUserSid=$alice;SubjectUserName='alice';SubjectDomainName='LAB';SubjectLogonId='0xa1'}))))
+    $events.Add((& $xml 4732 $sec '2026-02-01T10:06:00.0000000Z' (& $d ([ordered]@{MemberName='-';MemberSid=$backdoor;TargetUserName='Administrators';TargetDomainName='Builtin';TargetSid='S-1-5-32-544';SubjectUserSid=$alice;SubjectUserName='alice';SubjectDomainName='LAB';SubjectLogonId='0xa1'}))))
+    $events.Add((& $xml 7045 'Service Control Manager' '2026-02-01T10:10:00.0000000Z' (& $d ([ordered]@{ServiceName='PSEXESVC';ImagePath='%SystemRoot%\PSEXESVC.exe';ServiceType='user mode service';StartType='demand start';AccountName='LocalSystem'})) '0x8080000000000000' 'System'))
+    $events.Add((& $xml 1116 'Microsoft-Windows-Windows Defender' '2026-02-01T10:12:00.0000000Z' (& $d ([ordered]@{'Threat Name'='HackTool:Win32/Mimikatz';Path='file:_C:\Users\Public\m.exe'})) '0x8000000000000000' 'Microsoft-Windows-Windows Defender/Operational'))
+    $events.Add((& $xml 5007 'Microsoft-Windows-Windows Defender' '2026-02-01T10:14:00.0000000Z' (& $d ([ordered]@{'Old Value'='';'New Value'='HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths\C:\Users\Public = 0x0'})) '0x8000000000000000' 'Microsoft-Windows-Windows Defender/Operational'))
+    $events.Add((& $xml 1102 'Microsoft-Windows-Eventlog' '2026-02-01T10:20:00.0000000Z' "<UserData><LogFileCleared xmlns='http://manifests.microsoft.com/win/2004/08/windows/eventlog'><SubjectUserSid>$alice</SubjectUserSid><SubjectUserName>alice</SubjectUserName><SubjectDomainName>LAB</SubjectDomainName><SubjectLogonId>0xa1</SubjectLogonId></LogFileCleared></UserData>" '0x4020000000000000'))
+    $tmp=Join-Path ([IO.Path]::GetTempPath()) ('EvtxAudit-V92P-'+[guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($tmp)
+    $saved=@{}
+    foreach ($name in @('RunPath','SpoolPath','FindingHeaders','Part','Summary','FindingCount','BurstCount')) { $saved[$name]=Get-Variable -Scope Script -Name $name -ValueOnly -ErrorAction SilentlyContinue }
+    try {
+        $script:RunPath=$tmp; $script:SpoolPath=Join-Path $tmp 'spool'; [void][IO.Directory]::CreateDirectory($script:SpoolPath)
+        $script:FindingHeaders=@('Номер','Event ID','Record ID','Приоритет','Категория','Событие','Что проверить','Время UTC','Компьютер','Папка источника','Файл журнала','Полный путь','Канал','Провайдер','Уровень Windows','Результат аудита','Инициатор','SID инициатора','Целевая УЗ','SID целевой УЗ','Участник группы','SID участника','IP источника','Порт источника','Рабочая станция','Тип входа','Logon ID цели','Logon ID инициатора','Session ID','Имя сеанса','Status','SubStatus','Процесс','Командная строка','Привилегии','Имя угрозы','Ресурс / путь','Старое время','Новое время','Сдвиг времени, сек','Данные события','Описание Windows','Статус описания','Правило','SHA256 XML события','Восстановление XML')
+        $script:Part=0; $script:Summary=@{}; $script:FindingCount=[long]0; $script:BurstCount=0; $script:EvidenceWriter=$null; $script:FindingWriter=$null
+        $script:ErrorWriter=New-Writer (Join-Path $tmp 'Errors.csv'); Write-Row $script:ErrorWriter @('Время UTC','Этап','Файл источника','Record ID','Ошибка')
+        $script:BurstWriter=New-Writer (Join-Path $tmp 'AuthBursts.csv')
+        Write-Row $script:BurstWriter @('Приоритет','Event ID','Событие','Папка источника','Компьютер','Источник','Окно: начало UTC','Окно: конец UTC','Событий в окне','Разных УЗ','Учетные записи','Номера находок (пример)','Файлы и Record ID (пример)','Коды статуса','Комментарий')
+        New-FindingFile
+        $file=New-Object IO.FileInfo((Join-Path $tmp 'logs\Security.evtx'))
+        $spool=@{}
+        foreach ($x in $events) {
+            $e=Parse-Event $x; $r=Match-Event $e $false
+            if ($r) { $e.Fingerprint=Hash-Text $e.Xml; $id=Save-Finding $e $r $file ''; if ($e.Id -in $script:FailureIds) { Save-Failure $e $file $id $spool } }
+        }
+        foreach ($w in $spool.Values) { Close-Writer $w }
+        Close-Writer $script:FindingWriter
+        foreach ($sp in (Get-ChildItem -LiteralPath $script:SpoolPath -Filter '*.jsonl' -File)) { Correlate-Failures $sp.FullName }
+        Close-Writer $script:BurstWriter
+        $expectedFindings=$events.Count; if (-not $IncludeNoise) { $expectedFindings-- }
+        Assert-True ($script:FindingCount -eq $expectedFindings) 'v9.2 pipeline: computer-account 4672 filtered unless -IncludeNoise, other events are findings'
+        Build-Triage $tmp
+        $script:ErrorWriter.Flush()
+        Assert-True (-not $script:TriageHasErrors) 'v9.2 pipeline: triage without errors'
+        $out=@(Import-Csv -LiteralPath (Join-Path $tmp 'Triage.csv') -Delimiter $Delimiter -Encoding UTF8)
+        $scenarios=@($out | ForEach-Object { $_.'Сценарий' })
+        foreach ($expected in @('Password spraying с одного источника','Подбор пароля к УЗ','Отказы RDP с неверным паролем → успешный вход','RDP-вход с внешнего IP','RDP-сеанс: создание УЗ',
+            'Новая УЗ получила привилегии','Служба удаленного выполнения (PsExec/Impacket)','Добавлено исключение Defender','Обнаружение угрозы → отключение защиты','RDP-сеанс: очистка журнала Security','Очистка журнала')) {
+            Assert-True ($expected -in $scenarios) ('v9.2 pipeline detects: '+$expected)
+        }
+        $inc=@(Import-Csv -LiteralPath (Join-Path $tmp 'Incidents.csv') -Delimiter $Delimiter -Encoding UTF8)
+        Assert-True ($inc.Count -eq 1 -and $inc[0].'Компьютер' -eq 'WS01.lab.local' -and $inc[0].'Приоритет' -eq $script:P1) 'v9.2 pipeline: one P1 incident'
+    } finally {
+        foreach ($k in $saved.Keys) { Set-Variable -Scope Script -Name $k -Value $saved[$k] }
+        Close-Writer $script:ErrorWriter
+        Remove-Item -LiteralPath $tmp -Recurse -Force
+    }
+}
 if ($SelfTest) {
     # Fixtures use deterministic thresholds, independent of scan parameters.
     $FailureThreshold=10; $WindowMinutes=10; $TriageWindowMinutes=30; $SprayUserThreshold=5
@@ -2114,6 +2700,8 @@ if ($SelfTest) {
     Test-V81
     Test-V9
     Test-V92Parse
+    Test-V92Triage
+    Test-V92Pipeline
     Write-Host ('ALL SELFTESTS PASSED — version '+$script:Version)
     } finally { $script:HashEngine.Dispose() }
     return
