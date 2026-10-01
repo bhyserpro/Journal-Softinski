@@ -36,7 +36,7 @@ param(
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$script:Version = '9.0.0'
+$script:Version = '9.1.0'
 $script:Utf8 = New-Object System.Text.UTF8Encoding($true)
 $script:Invariant = [Globalization.CultureInfo]::InvariantCulture
 $script:FastCellInvalid=New-Object Text.RegularExpressions.Regex('[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]')
@@ -78,13 +78,17 @@ Microsoft-Windows-Security-Auditing	4913	Права доступа	Medium	Изм
 Microsoft-Windows-Security-Auditing	4717	Привилегии / удаленный доступ	High	Учетной записи предоставлено право входа	Проверить TargetSid и AccessGranted; особенно SeRemoteInteractiveLogonRight, SeNetworkLogonRight и SeServiceLogonRight.
 Microsoft-Windows-Security-Auditing	4718	Привилегии / удаленный доступ	Medium	У учетной записи отозвано право входа	Проверить TargetSid и AccessRemoved; изменение прав входа должно быть согласовано.
 Microsoft-Windows-Security-Auditing	4765	Привилегии	High	SID History добавлен к УЗ	Проверить назначенные права/SID и согласование изменения.
+Microsoft-Windows-Security-Auditing	4766	Привилегии	High	Неудачная попытка добавить SID History к УЗ	Попытка изменения SID History не удалась; проверить инициатора и цель — сама попытка подозрительна.
+Microsoft-Windows-Security-Auditing	4964	Привилегии	Medium	Вход члена особой группы (Special Groups)	Особые группы задаются политикой аудита Special Logon; проверить УЗ, источник входа и тип входа.
 Microsoft-Windows-Security-Auditing	4672	Привилегии	Low	Специальные привилегии назначены при входе	Контекст привилегированного входа; это не доказательство повышения привилегий.
 Microsoft-Windows-Security-Auditing	4625	Аутентификация	Low	Неудачный вход	Проверить Status/SubStatus; повторные отказы могут быть вызваны сохраненным старым паролем.
+Microsoft-Windows-Security-Auditing	4648	Удаленный доступ	Low	Вход с явными учетными данными	Проверить инициатора, целевую УЗ, TargetServerName и процесс; характерно для runas, подключения к ресурсам и бокового перемещения.
 Microsoft-Windows-Security-Auditing	4771	Аутентификация	Low	Ошибка предварительной аутентификации Kerberos	Проверить Status/SubStatus; повторные отказы могут быть вызваны сохраненным старым паролем.
 Microsoft-Windows-Security-Auditing	4776	Аутентификация	Low	Проверка учетных данных NTLM	Проверить Status/SubStatus; повторные отказы могут быть вызваны сохраненным старым паролем.
 Microsoft-Windows-Security-Auditing	4740	Аутентификация	Medium	Учетная запись заблокирована	Проверить источник и контекст; само событие не доказывает атаку или успешный вход.
 Microsoft-Windows-Security-Auditing	4624	Удаленный доступ	Info	Успешный вход	RDP определяется типом входа/именем сеанса; отключение не тождественно выходу.
 Microsoft-Windows-Security-Auditing	4634	Удаленный доступ	Info	Сеанс входа завершен	RDP определяется типом входа/именем сеанса; отключение не тождественно выходу.
+Microsoft-Windows-Security-Auditing	4647	Удаленный доступ	Info	Выход, инициированный пользователем	Закрывает RDP-интервал по Logon ID; для локального сеанса — только контекст.
 Microsoft-Windows-Security-Auditing	4778	Удаленный доступ	Info	Повторное подключение к сеансу Window Station	RDP определяется типом входа/именем сеанса; отключение не тождественно выходу.
 Microsoft-Windows-Security-Auditing	4779	Удаленный доступ	Info	Отключение от сеанса Window Station	RDP определяется типом входа/именем сеанса; отключение не тождественно выходу.
 Microsoft-Windows-Security-Auditing	4719	Политики защиты	High	Изменена политика аудита	Проверить значения и согласованное администрирование.
@@ -93,6 +97,7 @@ Microsoft-Windows-Security-Auditing	4904	Политики защиты	High	По
 Microsoft-Windows-Security-Auditing	4905	Политики защиты	High	Попытка отменить регистрацию источника событий безопасности	Может повлиять на журналирование; проверить инициатора, источник и согласование.
 Microsoft-Windows-Security-Auditing	4906	Политики защиты	High	Изменено значение CrashOnAuditFail	Изменение поведения системы при невозможности записывать аудит; проверить новое значение и инициатора.
 Microsoft-Windows-Security-Auditing	4907	Политики защиты	High	Изменены параметры аудита объекта	Проверить значения и согласованное администрирование.
+Microsoft-Windows-Security-Auditing	4715	Политики защиты	High	Изменена политика аудита (SACL) объекта политики	Изменение SACL самой политики аудита; проверить инициатора и согласование.
 Microsoft-Windows-Security-Auditing	4739	Политики защиты	High	Изменена политика домена	Проверить значения и согласованное администрирование.
 Microsoft-Windows-Security-Auditing	4697	Закрепление / запуск	Medium	Установлена служба	Проверить автора, исполняемый файл/команду, учетную запись запуска и заявку.
 Microsoft-Windows-Security-Auditing	4698	Закрепление / запуск	Medium	Создано задание планировщика	Проверить автора, исполняемый файл/команду, учетную запись запуска и заявку.
@@ -113,6 +118,7 @@ Microsoft-Windows-Eventlog	1101	Журналы	High	Потеряны событ�
 Microsoft-Windows-Eventlog	1104	Журналы	High	Журнал Security заполнен	Очистка/потеря/остановка журналирования требует проверки; остановка возможна при штатном выключении.
 Microsoft-Windows-Eventlog	1108	Журналы	High	Ошибка обработки входящего события журналирования	Очистка/потеря/остановка журналирования требует проверки; остановка возможна при штатном выключении.
 Microsoft-Windows-Kernel-General	1	Время	Medium	Изменено системное время	Проверить OldTime/NewTime и причину; возможна штатная коррекция.
+Microsoft-Windows-Kernel-General	24	Время	Medium	Изменен/обновлен часовой пояс	Проверить текущее смещение (bias) и инициатора; обновление также записывается при загрузке.
 Microsoft-Windows-Kernel-General	12	Контекст	Info	Запуск операционной системы	Контекст загрузки/выключения.
 Microsoft-Windows-Kernel-General	13	Контекст	Info	Остановка операционной системы	Контекст загрузки/выключения.
 Microsoft-Windows-Kernel-Power	41	Сбои	High	Перезапуск после некорректного завершения	Не определяет причину сбоя; проверить питание, дампы и соседние события.
@@ -138,6 +144,8 @@ Microsoft-Windows-Windows Defender	1015	Антивирус	High	Defender обн�
 Microsoft-Windows-Windows Defender	1008	Антивирус	High	Ошибка действия Defender (старый формат)	Проверить угрозу, ресурс, действие и результат; обнаружение не доказывает запуск/заражение.
 Microsoft-Windows-Windows Defender	1118	Антивирус	High	Ошибка действия Defender	Проверить угрозу, ресурс, действие и результат; обнаружение не доказывает запуск/заражение.
 Microsoft-Windows-Windows Defender	1119	Антивирус	High	Критическая ошибка действия Defender	Проверить угрозу, ресурс, действие и результат; обнаружение не доказывает запуск/заражение.
+Microsoft-Windows-Windows Defender	1121	Антивирус	High	Правило ASR/Exploit Guard заблокировало операцию	Проверить правило ASR, процесс и путь; блокировка может быть ложной для легитимного ПО.
+Microsoft-Windows-Windows Defender	2012	Антивирус	Medium	Ошибка Dynamic Signature Service Defender	Ошибка получения динамических сигнатур/облачной защиты; проверить связь и состояние защиты.
 Microsoft-Windows-Windows Defender	1007	Антивирус	Medium	Defender выполнил действие (старый формат)	Для 1117/1007 проверить конкретное действие: Allow не означает удаление угрозы.
 Microsoft-Windows-Windows Defender	1117	Антивирус	Medium	Defender выполнил действие над угрозой	Для 1117/1007 проверить конкретное действие: Allow не означает удаление угрозы.
 Microsoft-Windows-Windows Defender	1013	Антивирус	Medium	Удалена история обнаружений Defender	Для 1117/1007 проверить конкретное действие: Allow не означает удаление угрозы.
@@ -169,7 +177,6 @@ Microsoft-Windows-TaskScheduler	141	Закрепление / запуск	Medium
 # The rules below are high-volume or purely operational; -IncludeNoise returns them.
 $script:NoiseRules = [System.Collections.Generic.HashSet[string]]::new([string[]]@(
     'Microsoft-Windows-Security-Auditing|4670',  # object permissions: very noisy with Object Access audit
-    'Microsoft-Windows-Security-Auditing|4672',  # special privileges at logon: context only, one per admin/service logon
     'Microsoft-Windows-Security-Auditing|4700',
     'Microsoft-Windows-Security-Auditing|4701',
     'Microsoft-Windows-Security-Auditing|4705',
@@ -181,22 +188,16 @@ $script:NoiseRules = [System.Collections.Generic.HashSet[string]]::new([string[]
     'Microsoft-Windows-Security-Auditing|4913',
     'Microsoft-Windows-Security-Auditing|4950',
     'Microsoft-Windows-Security-Auditing|4954',  # firewall GPO refresh
-    'Microsoft-Windows-Kernel-General|1',         # time sync; Security 4616 is the security signal
     'Microsoft-Windows-Kernel-General|12',
     'Microsoft-Windows-Kernel-General|13',
-    'EventLog|6005',
-    'EventLog|6006',
     'Service Control Manager|7000',
     'Service Control Manager|7001',
     'Service Control Manager|7011',
     'Service Control Manager|7023',
     'Service Control Manager|7024',
-    'Service Control Manager|7031',
-    'Service Control Manager|7034',
     'Application Error|1000',
     'Windows Error Reporting|1001',
     'Microsoft-Windows-Windows Defender|1013',
-    'Microsoft-Windows-TerminalServices-LocalSessionManager|22',
     'Microsoft-Windows-Sysmon|6',
     'Microsoft-Windows-TaskScheduler|140'
 ))
@@ -210,7 +211,9 @@ foreach ($r in $script:RuleTable) { $script:Rules[($r.Provider + '|' + $r.Id)] =
 $script:RdpRelevant = [System.Collections.Generic.HashSet[string]]::new([string[]]@(
     'Microsoft-Windows-Security-Auditing|4608','Microsoft-Windows-Security-Auditing|4616',
     'Microsoft-Windows-Security-Auditing|4624','Microsoft-Windows-Security-Auditing|4634',
-    'Microsoft-Windows-Security-Auditing|4778','Microsoft-Windows-Security-Auditing|4779',
+    'Microsoft-Windows-Security-Auditing|4778','Microsoft-Windows-Security-Auditing|4779','Microsoft-Windows-Security-Auditing|4647',
+    'Microsoft-Windows-TerminalServices-LocalSessionManager|21','Microsoft-Windows-TerminalServices-LocalSessionManager|23',
+    'Microsoft-Windows-TerminalServices-LocalSessionManager|24','Microsoft-Windows-TerminalServices-LocalSessionManager|25',
     'Microsoft-Windows-Eventlog|1102'))
 $script:FailureIds=@(4625,4771,4776)
 $script:HasStart=$PSBoundParameters.ContainsKey('StartTime')
@@ -450,7 +453,7 @@ function Match-Event($e, [bool]$VendorFile) {
                 $r.Note = 'Сетевой доступ: возможны SMB, WinRM, службы и другие механизмы; не доказательство RDP.'
             } else { return }
         }
-        if ($r -and $e.Id -eq 4672 -and (Field $d @('SubjectUserSid')) -in @('S-1-5-18','S-1-5-19','S-1-5-20')) {
+        if ($r -and $e.Id -in @(4672,4648) -and (Field $d @('SubjectUserSid')) -in @('S-1-5-18','S-1-5-19','S-1-5-20')) {
             if (-not $IncludeNoise) { return }
             $r.Severity = 'Info'; $r.Note += ' Встроенная служебная учетная запись.'
         }
@@ -512,8 +515,9 @@ function Build-Query([string]$Path, [bool]$VendorFile) {
     if ($script:GenericErrors) { $selectors.Add("*[System[(Level=1 or Level=2) and $common]]") }
     $groups = $script:RuleTable | Group-Object Provider
     foreach ($g in $groups) {
-        # 4624/4634 need LogonType, 4776 needs Status: dedicated selectors below.
+        # 4624/4634 need LogonType, 4776 needs Status, 4672/4648 need SubjectUserSid: dedicated selectors below.
         $excludedSecurityIds=@(4624,4634,4776)
+        if (-not $IncludeNoise) { $excludedSecurityIds+=@(4672,4648) }
         $ids = @($g.Group | Where-Object { $_.Provider -ne 'Microsoft-Windows-Security-Auditing' -or [int]$_.Id -notin $excludedSecurityIds } | ForEach-Object { [int]$_.Id })
         # Short selectors keep each XPath below Windows Event Log complexity limits.
         for ($i=0; $i -lt $ids.Count; $i+=8) {
@@ -523,6 +527,13 @@ function Build-Query([string]$Path, [bool]$VendorFile) {
         }
     }
     $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and (EventID=4624 or EventID=4634)$time] and EventData[Data[@Name='LogonType']='10']]")
+    if (-not $IncludeNoise) {
+        # Built-in service accounts (SYSTEM, LOCAL SERVICE, NETWORK SERVICE) produce the bulk of 4672/4648.
+        foreach ($sidId in @(4672,4648)) {
+            if (-not $script:Rules.ContainsKey('Microsoft-Windows-Security-Auditing|'+$sidId)) { continue }
+            $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=$sidId$time] and EventData[Data[@Name='SubjectUserSid']!='S-1-5-18' and Data[@Name='SubjectUserSid']!='S-1-5-19' and Data[@Name='SubjectUserSid']!='S-1-5-20']]")
+        }
+    }
     if ($script:Rules.ContainsKey('Microsoft-Windows-Security-Auditing|4776')) {
         # Successful NTLM validations (Status 0x0) are the bulk of 4776 on DCs and are never findings.
         $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4776$time] and EventData[Data[@Name='Status']!='0x0']]")
@@ -595,22 +606,57 @@ function Save-Finding($e,$r,$file,[string]$EvidencePath) {
     return $id
 }
 
-# RDP intervals: conservative pairing inside ONE file, by computer + logon ID.
+# RDP intervals: conservative pairing inside ONE file.
+#  Security: computer + Logon ID; start 4624 type 10 / 4778 (RDP-*), end 4634 / 4647 / 4779.
+#  TerminalServices-LocalSessionManager: computer + Session ID; start 21 / 25 with a remote
+#  address, end 23 (logoff) / 24 (disconnect).
+# An end event right after an already closed interval (logoff after disconnect, 24 after 23)
+# is a trailing event of the same session and does not create a "start not found" row.
+$script:LsmProvider='Microsoft-Windows-TerminalServices-LocalSessionManager'
+$script:RdpClosed=@{}
+$script:RdpTotals=@{}
 function Rdp-Key($e) { return $e.Computer.ToLowerInvariant()+'|'+$e.LogonId.ToLowerInvariant() }
+function Format-Duration([double]$Seconds) {
+    $ts=[TimeSpan]::FromSeconds([Math]::Round($Seconds))
+    return ('{0}:{1:D2}:{2:D2}' -f [int][Math]::Floor($ts.TotalHours),$ts.Minutes,$ts.Seconds)
+}
 function Save-Rdp($start,$end,[string]$Status,[string]$Reason) {
     $script:RdpCount++
-    $duration=''; $endTime=''; $endRecord=''; $endId=''; $endEvent=''
+    $duration=''; $durationText=''; $endTime=''; $endRecord=''; $endId=''; $endEvent=''
     if ($end) { $endTime=$end.TimeUtc; $endRecord=$end.RecordId; $endId=$end.FindingId; $endEvent=$end.Id }
+    $anchor=$end; if ($start) { $anchor=$start }
     if ($start -and $end -and $Status -eq 'Paired') {
         $seconds=($end.Ticks-$start.Ticks)/[TimeSpan]::TicksPerSecond
         if ($seconds -lt 0 -or $seconds -gt $MaxRdpHours*3600) { $Status='UncertainDuration'; $Reason='Отрицательная или слишком большая длительность; проверить часы/границы загрузки.' }
-        else { $duration=$seconds.ToString('0.###',$script:Invariant) }
+        else {
+            $duration=$seconds.ToString('0.###',$script:Invariant); $durationText=Format-Duration $seconds
+            $account=$start.Target; if (-not $account) { $account=$end.Target }
+            $totalKey=($start.Computer+'|'+$account+'|'+$start.SourceIP+'|'+$start.Source).ToLowerInvariant()
+            if (-not $script:RdpTotals.ContainsKey($totalKey)) {
+                $script:RdpTotals[$totalKey]=[pscustomobject]@{Computer=$start.Computer;Account=$account;SourceIP=$start.SourceIP;Source=$start.Source;Count=0;Seconds=[double]0;Max=[double]0;First=$start.TimeUtc;Last=$end.TimeUtc}
+            }
+            $t=$script:RdpTotals[$totalKey]
+            $t.Count++; $t.Seconds+=$seconds
+            if ($seconds -gt $t.Max) { $t.Max=$seconds }
+            if ([string]::CompareOrdinal($start.TimeUtc,$t.First) -lt 0) { $t.First=$start.TimeUtc }
+            if ([string]::CompareOrdinal($end.TimeUtc,$t.Last) -gt 0) { $t.Last=$end.TimeUtc }
+        }
     }
-    $anchor=$end; if ($start) { $anchor=$start }
     $startTime=''; $startRecord=''; $startId=''; $startEvent=''
     if ($start) { $startTime=$start.TimeUtc; $startRecord=$start.RecordId; $startId=$start.FindingId; $startEvent=$start.Id }
-    Write-Row $script:RdpWriter @($startEvent,$endEvent,$anchor.File,$anchor.Computer,$anchor.Target,$anchor.LogonId,$anchor.SourceIP,
-        $startTime,$endTime,$duration,(Ru-RdpStatus $Status),$Reason,$startRecord,$endRecord,$startId,$endId)
+    $ip=$anchor.SourceIP; if (-not $ip -and $start -and $end) { $ip=$end.SourceIP }
+    Write-Row $script:RdpWriter @($startEvent,$endEvent,$anchor.File,$anchor.Computer,$anchor.Target,$anchor.LogonId,$ip,
+        $startTime,$endTime,$duration,$durationText,(Ru-RdpStatus $Status),$Reason,$startRecord,$endRecord,$startId,$endId,$anchor.Source)
+}
+function Write-RdpTotals([string]$Path) {
+    $w=New-Writer $Path
+    try {
+        Write-Row $w @('Компьютер','Учетная запись','IP источника','Источник данных','Сеансов (пар)','Суммарная длительность, сек','Суммарная длительность (ч:мм:сс)','Максимальный сеанс (ч:мм:сс)','Первое подключение UTC','Последнее отключение UTC','Комментарий')
+        foreach ($t in (@($script:RdpTotals.Values) | Sort-Object -Property @('Computer','Account','SourceIP','Source'))) {
+            Write-Row $w @($t.Computer,$t.Account,$t.SourceIP,$t.Source,$t.Count,$t.Seconds.ToString('0.###',$script:Invariant),(Format-Duration $t.Seconds),(Format-Duration $t.Max),$t.First,$t.Last,
+                'Сумма только по парам «начало–конец» со статусом «Пара найдена». Security и TerminalServices описывают одни и те же сеансы разными событиями: не складывайте их строки.')
+        }
+    } finally { Close-Writer $w }
 }
 function Reset-Rdp($state,[string]$Computer,[string]$Reason) {
     foreach ($key in @($state.Keys)) {
@@ -619,6 +665,25 @@ function Reset-Rdp($state,[string]$Computer,[string]$Reason) {
             $state.Remove($key)
         }
     }
+    $prefix=$Computer.ToLowerInvariant()+'|'
+    foreach ($key in @($script:RdpClosed.Keys)) { if (-not $Computer -or $key.StartsWith($prefix)) { $script:RdpClosed.Remove($key) } }
+}
+function Handle-RdpPoint($state,[string]$Key,$Point,[bool]$IsStart,[bool]$ReportOrphan,[string]$PairReason) {
+    if ($IsStart) {
+        if ($state.ContainsKey($Key)) { Save-Rdp $state[$Key] $null 'MissingEnd' 'Новый вход/переподключение до найденного конца; прежний интервал не закрывается предположением.' }
+        $state[$Key]=$Point
+        $script:RdpClosed.Remove($Key)
+    } elseif ($state.ContainsKey($Key)) {
+        $start=$state[$Key]
+        if ($start.Target -and $Point.Target -and $start.Target -ne $Point.Target) {
+            Save-Rdp $start $null 'MissingEnd' 'Разные учетные записи при одинаковом идентификаторе сеанса.'
+            Save-Rdp $null $Point 'MissingStart' 'Начало с подходящей учетной записью не найдено.'
+        } else { Save-Rdp $start $Point 'Paired' $PairReason }
+        $state.Remove($Key)
+        $script:RdpClosed[$Key]=$true
+    } elseif ($script:RdpClosed.ContainsKey($Key)) {
+        return  # trailing end of an interval that is already closed
+    } elseif ($ReportOrphan) { Save-Rdp $null $Point 'MissingStart' 'Начало в этом файле не найдено; выход после ранее зафиксированного отключения также возможен.' }
 }
 function Handle-Rdp($e,$state,[string]$File,[long]$FindingId) {
     if (($e.Provider -eq 'Microsoft-Windows-Security-Auditing' -and $e.Id -in @(4608,4616)) -or
@@ -626,25 +691,31 @@ function Handle-Rdp($e,$state,[string]$File,[long]$FindingId) {
         Reset-Rdp $state $e.Computer 'Запуск ОС, изменение часов или очистка журнала: пара не строится через эту границу.'
         return
     }
-    if ($e.Provider -ne 'Microsoft-Windows-Security-Auditing' -or -not $e.Computer -or -not $e.LogonId -or $e.LogonId -eq '0x0') { return }
+    if (-not $e.Computer) { return }
+    if ($e.Provider -eq $script:LsmProvider) {
+        $session=Field $e.Data @('SessionID','SessionId')
+        if (-not $session -or $e.Id -notin @(21,23,24,25)) { return }
+        $address=$e.SourceIP
+        $remote=$address -and $address -notin @('LOCAL','127.0.0.1','::1')
+        $isStart=$e.Id -in @(21,25)
+        if ($isStart -and -not $remote) { return }  # console / local session
+        $key=$e.Computer.ToLowerInvariant()+'|lsm|'+$session
+        $point=[pscustomobject]@{File=$File;Computer=$e.Computer;Target=(Field $e.Data @('User'));LogonId=('Session '+$session);SourceIP=$address;
+            TimeUtc=$e.TimeUtc;Ticks=$e.Ticks;RecordId=$e.RecordId;FindingId=$FindingId;Id=$e.Id;Source='TerminalServices-LocalSessionManager'}
+        Handle-RdpPoint $state $key $point $isStart ($e.Id -eq 24 -and $remote) 'Интервал по TerminalServices-LocalSessionManager (Session ID): от входа/переподключения до выхода/отключения, не активность пользователя.'
+        return
+    }
+    if ($e.Provider -ne 'Microsoft-Windows-Security-Auditing' -or -not $e.LogonId -or $e.LogonId -eq '0x0') { return }
     $key=Rdp-Key $e
     $isRdpName=$e.SessionName -match '^RDP-'
     $isStart=($e.Id -eq 4624 -and $e.LogonType -eq '10') -or ($e.Id -eq 4778 -and $isRdpName)
-    $isEnd=($e.Id -eq 4634 -and ($e.LogonType -eq '10' -or $state.ContainsKey($key))) -or ($e.Id -eq 4779 -and ($isRdpName -or $state.ContainsKey($key)))
+    $known=$state.ContainsKey($key) -or $script:RdpClosed.ContainsKey($key)
+    # 4647 has no LogonType: it ends an interval only for a Logon ID already seen as RDP.
+    $isEnd=($e.Id -eq 4634 -and ($e.LogonType -eq '10' -or $known)) -or ($e.Id -eq 4779 -and ($isRdpName -or $known)) -or ($e.Id -eq 4647 -and $known)
     if (-not $isStart -and -not $isEnd) { return }
     $point=[pscustomobject]@{File=$File;Computer=$e.Computer;Target=$e.Target;LogonId=$e.LogonId;SourceIP=$e.SourceIP;
-        TimeUtc=$e.TimeUtc;Ticks=$e.Ticks;RecordId=$e.RecordId;FindingId=$FindingId;Id=$e.Id}
-    if ($isStart) {
-        if ($state.ContainsKey($key)) { Save-Rdp $state[$key] $null 'MissingEnd' 'Новый вход/переподключение до найденного конца; прежний интервал не закрывается предположением.' }
-        $state[$key]=$point
-    } elseif ($state.ContainsKey($key)) {
-        $start=$state[$key]
-        if ($start.Target -and $e.Target -and $start.Target -ne $e.Target) {
-            Save-Rdp $start $null 'MissingEnd' 'Разные учетные записи при одинаковом LogonId.'
-            Save-Rdp $null $point 'MissingStart' 'Начало с подходящей учетной записью не найдено.'
-        } else { Save-Rdp $start $point 'Paired' 'Интервал по Security; время между подключением и отключением/выходом, не активность пользователя.' }
-        $state.Remove($key)
-    } else { Save-Rdp $null $point 'MissingStart' 'Начало в этом файле не найдено; выход после ранее зафиксированного отключения также возможен.' }
+        TimeUtc=$e.TimeUtc;Ticks=$e.Ticks;RecordId=$e.RecordId;FindingId=$FindingId;Id=$e.Id;Source='Security'}
+    Handle-RdpPoint $state $key $point $isStart $true 'Интервал по Security; время между подключением и отключением/выходом, не активность пользователя.'
 }
 
 # Failure spool partitions: directory + computer + EventID. This avoids combining
@@ -799,7 +870,7 @@ function Run-SelfTest {
     try {
         $script:RdpCount=0; $script:BurstCount=0
         $script:RdpWriter=New-Writer (Join-Path $tmp 'rdp.csv')
-        Write-Row $script:RdpWriter @('StartEvent','EndEvent','File','Computer','Account','LogonId','Source','Start','End','Seconds','Status','Reason','StartRecord','EndRecord','StartFinding','EndFinding')
+        Write-Row $script:RdpWriter @('StartEvent','EndEvent','File','Computer','Account','LogonId','Source','Start','End','Seconds','Duration','Status','Reason','StartRecord','EndRecord','StartFinding','EndFinding','DataSource')
         $state=@{}
         $e=Parse-Event (Test-Xml 4624 $security '<EventData><Data Name="LogonType">10</Data><Data Name="TargetLogonId">0xabc</Data><Data Name="TargetUserName">alice</Data></EventData>')
         Handle-Rdp $e $state 'sample.evtx' 1
@@ -908,6 +979,7 @@ function Export-ReportsToExcel([string]$WorkPath,[string]$XlsxPath) {
         [pscustomobject]@{Name='Сводка';File='Summary.csv'},
         [pscustomobject]@{Name='Подбор_пароля';File='AuthBursts.csv'},
         [pscustomobject]@{Name='RDP_сеансы';File='RdpIntervals.csv'},
+        [pscustomobject]@{Name='RDP_итоги';File='RdpTotals.csv'},
         [pscustomobject]@{Name='Файлы';File='Files.csv'},
         [pscustomobject]@{Name='Качество_выгрузки';File='Coverage.csv'},
         [pscustomobject]@{Name='Ошибки';File='Errors.csv'}
@@ -1035,6 +1107,12 @@ function New-FallbackOverview([string]$WorkPath,[string]$Destination) {
         if (Test-Path -LiteralPath $path) {
             foreach ($row in (Import-Csv -LiteralPath $path -Delimiter $Delimiter -Encoding UTF8)) {
                 Write-Row $w @('RDP',($row.'Event ID начала'+' -> '+$row.'Event ID конца'),'Инфо','RDP-сеанс',$row.'Компьютер',$row.'Начало UTC',$row.'Окончание UTC',$row.'Учетная запись',$row.'IP источника',($row.'Record ID начала'+' -> '+$row.'Record ID конца'),$row.'Длительность, сек',$row.'Статус',$row.'Файл источника',$row.'Комментарий')
+            }
+        }
+        $path=Join-Path $WorkPath 'RdpTotals.csv'
+        if (Test-Path -LiteralPath $path) {
+            foreach ($row in (Import-Csv -LiteralPath $path -Delimiter $Delimiter -Encoding UTF8)) {
+                Write-Row $w @('RDP итог','','Инфо','Суммарное время RDP',$row.'Компьютер',$row.'Первое подключение UTC',$row.'Последнее отключение UTC',$row.'Учетная запись',$row.'IP источника','',$row.'Сеансов (пар)','',$row.'Источник данных',('Суммарно: '+$row.'Суммарная длительность (ч:мм:сс)'+'; максимум: '+$row.'Максимальный сеанс (ч:мм:сс)'))
             }
         }
         $path=Join-Path $WorkPath 'Files.csv'
@@ -1260,7 +1338,7 @@ function Add-SingleTriage($Groups,$r) {
     if ($security -and $id -in @(4728,4732,4756) -and (Is-PrivilegedGroup (Triage-Value $r 'SID целевой УЗ'))) {
         Add-Triage -Groups $Groups -Priority 'P1 — сначала' -Scenario 'Добавление в привилегированную группу' -Evidence 'Факт: SID группы относится к известной административной группе.' -Why 'Факт: SID группы относится к известной административной группе.' -Check 'Проверить заявку, инициатора, SID участника и последующие действия этой УЗ.' -Object ((Triage-Value $r 'SID участника')+' -> '+(Triage-Value $r 'SID целевой УЗ')) -Rows @($r)
     }
-    if ($security -and $id -in @(4904,4905,4906,4907,4739)) {
+    if ($security -and $id -in @(4904,4905,4906,4907,4739,4715)) {
         Add-Triage -Groups $Groups -Priority 'P2 — проверить' -Scenario 'Изменение механизма аудита или политики безопасности' -Evidence 'Факт: зарегистрировано изменение источника Security, CrashOnAuditFail, параметров аудита объекта или доменной политики.' -Why 'Факт: зарегистрировано изменение источника Security, CrashOnAuditFail, параметров аудита объекта или доменной политики.' -Check 'Проверить инициатора, точное старое/новое значение, заявку и последующие потери журналов.' -Object ((Triage-Value $r 'Инициатор')+' | '+$data) -Rows @($r)
     }
     if ($security -and $id -eq 4719) {
@@ -1383,7 +1461,7 @@ function Add-ChainTriageCore($Groups,[object[]]$Rows) {
                     Add-Triage -Groups $Groups -Priority 'P1 — сначала' -Scenario 'Новая УЗ получила привилегии' -Evidence ('Строго: SID созданной УЗ совпал с SID участника группы; интервал до '+$TriageWindowMinutes+' мин.') -Why ('Строго: SID созданной УЗ совпал с SID участника группы; интервал до '+$TriageWindowMinutes+' мин.') -Check 'Проверить, согласованы ли создание и выдача прав. Это цепочка действий, не доказательство атаки.' -Object ($r.'SID участника'+' | '+$start.'Record ID') -Rows @($start,$r)
                 }
             }
-            if ($id -eq 4634) {
+            if ($id -in @(4634,4647)) {
                 $ended=Triage-LogonId $r 'Logon ID цели'
                 if ($ended) { $rdp.Remove($ended) }
                 continue
@@ -1398,7 +1476,7 @@ function Add-ChainTriageCore($Groups,[object[]]$Rows) {
                     }
                 }
             }
-            $impact=@{4697='создание службы';4698='создание задания';4702='изменение задания';4719='изменение политики аудита';4904='регистрация источника Security';4905='отмена источника Security';4906='изменение CrashOnAuditFail';4907='изменение параметров аудита объекта';4739='изменение доменной политики';4946='добавление правила Firewall';4947='изменение правила Firewall';4948='удаление правила Firewall';4950='изменение параметра Firewall';4954='изменение Firewall через GPO';4720='создание УЗ';4722='включение УЗ';4723='изменение пароля';4724='сброс пароля';4728='добавление в глобальную группу';4732='добавление в локальную группу';4756='добавление в универсальную группу';4704='назначение права';4765='добавление SID History';4616='изменение времени'}
+            $impact=@{4697='создание службы';4698='создание задания';4702='изменение задания';4719='изменение политики аудита';4904='регистрация источника Security';4905='отмена источника Security';4906='изменение CrashOnAuditFail';4907='изменение параметров аудита объекта';4715='изменение SACL политики аудита';4739='изменение доменной политики';4946='добавление правила Firewall';4947='изменение правила Firewall';4948='удаление правила Firewall';4950='изменение параметра Firewall';4954='изменение Firewall через GPO';4720='создание УЗ';4722='включение УЗ';4723='изменение пароля';4724='сброс пароля';4728='добавление в глобальную группу';4732='добавление в локальную группу';4756='добавление в универсальную группу';4704='назначение права';4765='добавление SID History';4616='изменение времени'}
             $actorLogon=Triage-LogonId $r 'Logon ID инициатора'
             if ($impact.ContainsKey($id) -and $actorLogon -and $rdp.ContainsKey($actorLogon)) {
                 $start=$rdp[$actorLogon]; $delta=($time-[DateTimeOffset]::Parse($start.'Время UTC',$script:Invariant)).TotalMinutes
@@ -1406,7 +1484,7 @@ function Add-ChainTriageCore($Groups,[object[]]$Rows) {
                     Add-Triage -Groups $Groups -Priority 'P1 — сначала' -Scenario ('RDP-сеанс: '+$impact[$id]) -Evidence ('Строго: успешный RDP типа 10 связан с действием по одному Logon ID и SID; интервал до '+$TriageWindowMinutes+' мин.') -Why ('Строго: успешный RDP типа 10 связан с действием по одному Logon ID и SID; интервал до '+$TriageWindowMinutes+' мин.') -Check 'Проверить источник RDP, владельца УЗ, объект изменения, заявку и полную временную линию сеанса.' -Object ($actorLogon+' | '+$id) -Rows @($start,$r)
                 }
             }
-            if ($id -in @(4719,4904,4905,4906,4907,4739)) {
+            if ($id -in @(4719,4904,4905,4906,4907,4739,4715)) {
                 $actor=Triage-ActorKey $r
                 if ($actor) { $audit[$actor]=$r }
             }
@@ -1425,7 +1503,7 @@ function Add-ChainTriageCore($Groups,[object[]]$Rows) {
 }
 function Test-TriageCandidate($r) {
     $id=[int]$r.'Event ID'; $provider=$r.'Провайдер'
-    if ($provider -eq 'Microsoft-Windows-Security-Auditing' -and $id -in @(4608,4616,4624,4625,4634,4697,4698,4702,4704,4719,4720,4722,4723,4724,4728,4732,4739,4756,4765,4904,4905,4906,4907,4946,4947,4948,4950,4954)) { return $true }
+    if ($provider -eq 'Microsoft-Windows-Security-Auditing' -and $id -in @(4608,4616,4624,4625,4634,4647,4715,4697,4698,4702,4704,4719,4720,4722,4723,4724,4728,4732,4739,4756,4765,4904,4905,4906,4907,4946,4947,4948,4950,4954)) { return $true }
     if ($provider -eq 'Microsoft-Windows-Eventlog' -and $id -in @(104,1101,1102,1104,1108)) { return $true }
     return $false
 }
@@ -1735,7 +1813,7 @@ function Test-V8 {
         $serviceLogon=Parse-Event (Test-Xml 4672 $sec '<EventData><Data Name="SubjectUserSid">S-1-5-18</Data></EventData>')
         Assert-True ($null -eq (Match-Event $serviceLogon $false)) 'v8 SYSTEM 4672 excluded'
         $serviceLogon.Data['SubjectUserSid']='S-1-5-21-1-2-3-1001'
-        Assert-True ($null -eq (Match-Event $serviceLogon $false)) 'v9 user 4672 is noise by default (-IncludeNoise returns it)'
+        Assert-True ($null -ne (Match-Event $serviceLogon $false)) 'v8 user 4672 retained'
         Assert-True (-not $script:Rules.ContainsKey('Windows Error Reporting|1001')) 'v8 optional WER 1001 excluded'
         Assert-True ($script:Rules.ContainsKey('Microsoft-Windows-WER-SystemErrorReporting|1001')) 'v8 BugCheck 1001 retained'
     }
@@ -1811,6 +1889,79 @@ function Test-V9 {
     Assert-True (@((Build-Query 'C:\x\kaspersky.evtx' $true) -split '<Select>' | Where-Object { $_ -like '*</Select>*' -and $_ -notlike "*EventID&lt;=$MaxEventId*" }).Count -eq 0) 'v9 AV vendor selector limited by MaxEventId'
     Assert-True (@($selects | Where-Object { $_ -like "*EventID=4776*Status']!='0x0'*" }).Count -eq 1) 'v9 successful 4776 filtered by Windows API'
     Assert-True (@($selects | Where-Object { $_ -match '(^|[^<>!])EventID=4776 or|or EventID=4776\)' }).Count -eq 0) 'v9 4776 not selected unfiltered'
+    # Required event list (v9.1).
+    $required=@('Microsoft-Windows-Security-Auditing|4616','Microsoft-Windows-Kernel-General|1','Microsoft-Windows-Kernel-General|24',
+        'Microsoft-Windows-Security-Auditing|4724','Microsoft-Windows-Security-Auditing|4720','Microsoft-Windows-Security-Auditing|4726','Microsoft-Windows-Security-Auditing|4725',
+        'Microsoft-Windows-Security-Auditing|4738','Microsoft-Windows-Security-Auditing|4781','Microsoft-Windows-Security-Auditing|4741','Microsoft-Windows-Security-Auditing|4743',
+        'Microsoft-Windows-Security-Auditing|4765','Microsoft-Windows-Security-Auditing|4766','Microsoft-Windows-Security-Auditing|4704',
+        'Microsoft-Windows-Security-Auditing|4728','Microsoft-Windows-Security-Auditing|4732','Microsoft-Windows-Security-Auditing|4756',
+        'Microsoft-Windows-Security-Auditing|4729','Microsoft-Windows-Security-Auditing|4733','Microsoft-Windows-Security-Auditing|4757',
+        'Microsoft-Windows-Security-Auditing|4672','Microsoft-Windows-Security-Auditing|4964',
+        'Microsoft-Windows-Eventlog|1102','Microsoft-Windows-Eventlog|104','Microsoft-Windows-Eventlog|1100',
+        'Microsoft-Windows-Security-Auditing|4719','Microsoft-Windows-Security-Auditing|4907','Microsoft-Windows-Security-Auditing|4715',
+        'Microsoft-Windows-Security-Auditing|4624','Microsoft-Windows-Security-Auditing|4648','Microsoft-Windows-Security-Auditing|4778','Microsoft-Windows-Security-Auditing|4779',
+        'Microsoft-Windows-Security-Auditing|4625','Microsoft-Windows-Security-Auditing|4634','Microsoft-Windows-Security-Auditing|4647',
+        'Microsoft-Windows-TerminalServices-LocalSessionManager|22','Microsoft-Windows-TerminalServices-LocalSessionManager|23',
+        'Microsoft-Windows-TerminalServices-LocalSessionManager|24','Microsoft-Windows-TerminalServices-LocalSessionManager|25',
+        'Microsoft-Windows-TerminalServices-RemoteConnectionManager|1149',
+        'Microsoft-Windows-Windows Defender|1116','Microsoft-Windows-Windows Defender|1117','Microsoft-Windows-Windows Defender|1118','Microsoft-Windows-Windows Defender|1119',
+        'Microsoft-Windows-Windows Defender|1006','Microsoft-Windows-Windows Defender|5007','Microsoft-Windows-Windows Defender|5010','Microsoft-Windows-Windows Defender|1008',
+        'Microsoft-Windows-Windows Defender|1015','Microsoft-Windows-Windows Defender|1121','Microsoft-Windows-Windows Defender|5001','Microsoft-Windows-Windows Defender|2012',
+        'Microsoft-Windows-Windows Defender|5013','Microsoft-Windows-Security-Auditing|4771','Microsoft-Windows-Security-Auditing|4776',
+        'Microsoft-Windows-Kernel-Power|41','EventLog|6008','EventLog|6005','EventLog|6006','User32|1074','Service Control Manager|7031','Service Control Manager|7034')
+    foreach ($k in $required) {
+        if ([int]$k.Split('|')[1] -gt $MaxEventId) { continue }
+        Assert-True ($script:Rules.ContainsKey($k)) ('v9.1 required rule present: '+$k)
+    }
+    $e=Parse-Event (Test-Xml 4648 $sec '<EventData><Data Name="SubjectUserSid">S-1-5-18</Data><Data Name="TargetUserName">bob</Data></EventData>')
+    Assert-True (($null -eq (Match-Event $e $false)) -eq (-not $IncludeNoise)) 'v9.1 4648 by SYSTEM filtered unless -IncludeNoise'
+    $e.Data['SubjectUserSid']='S-1-5-21-1-2-3-1001'
+    Assert-True ($null -ne (Match-Event $e $false)) 'v9.1 4648 by user retained'
+    if (-not $IncludeNoise) {
+        Assert-True (@($selects | Where-Object { $_ -like "*EventID=4648*SubjectUserSid']!='S-1-5-18'*" }).Count -eq 1) 'v9.1 4648 system accounts filtered by Windows API'
+        Assert-True (@($selects | Where-Object { $_ -like "*EventID=4672*SubjectUserSid']!='S-1-5-18'*" }).Count -eq 1) 'v9.1 4672 system accounts filtered by Windows API'
+    }
+    # RDP sessions: 4624 -> 4647 pairing, trailing 4634 suppressed, LSM sessions, totals.
+    $tmp=Join-Path ([IO.Path]::GetTempPath()) ('EvtxAudit-V91-'+[guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($tmp)
+    try {
+        $script:RdpCount=0; $script:RdpClosed=@{}; $script:RdpTotals=@{}
+        $script:RdpWriter=New-Writer (Join-Path $tmp 'rdp.csv')
+        Write-Row $script:RdpWriter @('StartEvent','EndEvent','File','Computer','Account','LogonId','Source','Start','End','Seconds','Duration','Status','Reason','StartRecord','EndRecord','StartFinding','EndFinding','DataSource')
+        $state=@{}
+        $base=[DateTimeOffset]::Parse('2026-01-01T10:00:00Z')
+        $mk={ param([int]$Id,[string]$Provider,[string]$Payload,[int]$Minutes)
+            $x=Parse-Event (Test-Xml $Id $Provider $Payload)
+            $t=$base.AddMinutes($Minutes); $x.Ticks=$t.UtcDateTime.Ticks; $x.TimeUtc=$t.UtcDateTime.ToString('o')
+            return $x }
+        $logon='<EventData><Data Name="TargetUserName">alice</Data><Data Name="TargetDomainName">LAB</Data><Data Name="TargetLogonId">0x1a2</Data><Data Name="LogonType">10</Data><Data Name="IpAddress">192.0.2.9</Data></EventData>'
+        Handle-Rdp (& $mk 4624 $sec $logon 0) $state 'Security.evtx' 1
+        Handle-Rdp (& $mk 4647 $sec '<EventData><Data Name="TargetUserName">alice</Data><Data Name="TargetDomainName">LAB</Data><Data Name="TargetLogonId">0x1a2</Data></EventData>' 90) $state 'Security.evtx' 2
+        Handle-Rdp (& $mk 4634 $sec '<EventData><Data Name="TargetUserName">alice</Data><Data Name="TargetDomainName">LAB</Data><Data Name="TargetLogonId">0x1a2</Data><Data Name="LogonType">10</Data></EventData>' 91) $state 'Security.evtx' 3
+        Handle-Rdp (& $mk 4647 $sec '<EventData><Data Name="TargetUserName">carol</Data><Data Name="TargetLogonId">0x999</Data></EventData>' 92) $state 'Security.evtx' 4
+        Assert-True ($state.Count -eq 0 -and $script:RdpCount -eq 1) 'v9.1 RDP 4624 -> 4647 paired; trailing 4634 and local 4647 add no rows'
+        $lsm=$script:LsmProvider
+        $ud={ param([string]$Inner) return '<UserData><EventXML xmlns="Event_NS">'+$Inner+'</EventXML></UserData>' }
+        Handle-Rdp (& $mk 21 $lsm (& $ud '<User>LAB\bob</User><SessionID>3</SessionID><Address>192.0.2.20</Address>') 0) $state 'LSM.evtx' 5
+        Handle-Rdp (& $mk 24 $lsm (& $ud '<User>LAB\bob</User><SessionID>3</SessionID><Address>192.0.2.20</Address>') 30) $state 'LSM.evtx' 6
+        Handle-Rdp (& $mk 25 $lsm (& $ud '<User>LAB\bob</User><SessionID>3</SessionID><Address>192.0.2.20</Address>') 60) $state 'LSM.evtx' 7
+        Handle-Rdp (& $mk 23 $lsm (& $ud '<User>LAB\bob</User><SessionID>3</SessionID>') 75) $state 'LSM.evtx' 8
+        Handle-Rdp (& $mk 24 $lsm (& $ud '<User>LAB\bob</User><SessionID>3</SessionID><Address>192.0.2.20</Address>') 76) $state 'LSM.evtx' 9
+        Handle-Rdp (& $mk 21 $lsm (& $ud '<User>LAB\local</User><SessionID>1</SessionID><Address>LOCAL</Address>') 0) $state 'LSM.evtx' 10
+        Handle-Rdp (& $mk 23 $lsm (& $ud '<User>LAB\local</User><SessionID>1</SessionID>') 5) $state 'LSM.evtx' 11
+        Assert-True ($state.Count -eq 0 -and $script:RdpCount -eq 3) 'v9.1 LSM 21->24 and 25->23 paired; trailing 24 and console session ignored'
+        Close-Writer $script:RdpWriter
+        $rdp=@(Import-Csv -LiteralPath (Join-Path $tmp 'rdp.csv') -Delimiter $Delimiter)
+        Assert-True ($rdp[0].Seconds -eq '5400' -and $rdp[0].Duration -eq '1:30:00' -and $rdp[0].Source -eq '192.0.2.9' -and $rdp[0].DataSource -eq 'Security') 'v9.1 RDP duration seconds, h:mm:ss, IP and data source'
+        Assert-True ($rdp[1].Duration -eq '0:30:00' -and $rdp[2].Duration -eq '0:15:00' -and $rdp[2].Source -eq '192.0.2.20' -and $rdp[1].Account -eq 'LAB\bob') 'v9.1 LSM intervals keep user and address'
+        Write-RdpTotals (Join-Path $tmp 'totals.csv')
+        $totals=@(Import-Csv -LiteralPath (Join-Path $tmp 'totals.csv') -Delimiter $Delimiter -Encoding UTF8)
+        $bob=@($totals | Where-Object { $_.'Учетная запись' -eq 'LAB\bob' })
+        Assert-True ($totals.Count -eq 2 -and $bob.Count -eq 1 -and $bob[0].'Сеансов (пар)' -eq '2' -and $bob[0].'Суммарная длительность (ч:мм:сс)' -eq '0:45:00' -and $bob[0].'Максимальный сеанс (ч:мм:сс)' -eq '0:30:00') 'v9.1 RDP totals per computer/account/IP'
+    } finally {
+        Close-Writer $script:RdpWriter
+        Remove-Item -LiteralPath $tmp -Recurse -Force
+    }
     Write-Host 'V9 SelfTest OK'
 }
 if ($SelfTest) {
@@ -1858,7 +2009,7 @@ Write-Row $script:ErrorWriter @('Время UTC','Этап','Файл источ
 $inventoryWriter=New-Writer (Join-Path $script:RunPath 'Files.csv')
 Write-Row $inventoryWriter @('Полный путь','Размер, байт','Изменен UTC','SHA256 файла','Статус обработки','Прочитано подходящих событий','Находок','Ошибок разбора','Нет описания Windows','Время первой записи UTC','Время последней записи UTC','Каналы','Компьютеры','Способ отбора','Комментарий','Время обработки, сек')
 $script:RdpWriter=New-Writer (Join-Path $script:RunPath 'RdpIntervals.csv')
-Write-Row $script:RdpWriter @('Event ID начала','Event ID конца','Файл источника','Компьютер','Учетная запись','Logon ID','IP источника','Начало UTC','Окончание UTC','Длительность, сек','Статус','Комментарий','Record ID начала','Record ID конца','Номер находки начала','Номер находки конца')
+Write-Row $script:RdpWriter @('Event ID начала','Event ID конца','Файл источника','Компьютер','Учетная запись','Logon ID / Session ID','IP источника','Начало UTC','Окончание UTC','Длительность, сек','Длительность (ч:мм:сс)','Статус','Комментарий','Record ID начала','Record ID конца','Номер находки начала','Номер находки конца','Источник данных')
 $script:BurstWriter=New-Writer (Join-Path $script:RunPath 'AuthBursts.csv')
 Write-Row $script:BurstWriter @('Приоритет','Event ID','Событие','Папка источника','Компьютер','Источник','Окно: начало UTC','Окно: конец UTC','Событий в окне','Разных УЗ','Учетные записи','Номера находок (пример)','Файлы и Record ID (пример)','Коды статуса','Комментарий')
 New-FindingFile
@@ -1886,7 +2037,7 @@ try {
         if ($script:GenericErrors) { $note='Отбор через Windows API выполнен; читаются только записи по правилам и Critical/Error.'; $selectionMethod='Правила + Critical/Error' }
         else { $note='Отбор через Windows API выполнен; читаются только записи по правилам (общий отбор Critical/Error выключен, см. -IncludeAllErrors).'; $selectionMethod='Правила' }
         if ($script:HasStart -or $script:HasEnd) { $note+=' Задан период -StartTime/-EndTime: события вне периода не читались.' }
-        $first=''; $last=''; $reader=$null; $state=@{}; $spoolWriters=@{}; $lastTimes=@{}
+        $first=''; $last=''; $reader=$null; $state=@{}; $spoolWriters=@{}; $lastTimes=@{}; $script:RdpClosed=@{}
         $channels=New-Object 'System.Collections.Generic.HashSet[string]'
         $computers=New-Object 'System.Collections.Generic.HashSet[string]'
         $xmlRecovered=0
@@ -2032,6 +2183,7 @@ try {
             $script:FindingWriter.Flush(); $script:ErrorWriter.Flush()
         }
     }
+    Write-RdpTotals (Join-Path $script:RunPath 'RdpTotals.csv')
     if (-not $SkipCorrelation) {
         $phaseTimer=[Diagnostics.Stopwatch]::StartNew()
         Write-Host 'Корреляция неудачных аутентификаций...'
