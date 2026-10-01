@@ -284,6 +284,8 @@ function Ru-AuditOutcome([string]$Value) {
         default { return $Value }
     }
 }
+$script:RuSeverityMap=@{}; foreach ($v in @('High','Medium','Low','Info')) { $script:RuSeverityMap[$v]=Ru-Severity $v }
+$script:RuAuditMap=@{}; foreach ($v in @('Success','Failure','')) { $script:RuAuditMap[$v]=Ru-AuditOutcome $v }
 function Ru-MessageStatus([string]$Value) {
     switch ($Value) {
         'Available' { return 'Доступно' }
@@ -292,6 +294,7 @@ function Ru-MessageStatus([string]$Value) {
         default { return $Value }
     }
 }
+$script:RuMessageMap=@{}; foreach ($v in @('Available','Unavailable','NotRequested')) { $script:RuMessageMap[$v]=Ru-MessageStatus $v }
 function Ru-FileStatus([string]$Value) {
     switch ($Value) {
         'OK' { return 'OK' }
@@ -371,7 +374,114 @@ function Repair-XmlCharacters([string]$Text) {
     })
 }
 
+# Fields resolved once per event (first non-empty, non-'-' value among the names).
+# Replaces ~28 calls of Field per finding; semantics are identical to Field.
+$script:FieldSpecs=@(
+    @('SubjectDomainName','SubjectDomainName'),@('SubjectUserName','SubjectUserName'),
+    @('TargetDomain','TargetDomainName','AccountDomain'),@('TargetUser','TargetUserName','AccountName'),
+    @('SourceIP','IpAddress','ClientAddress','Address','Param3'),@('LogonType','LogonType'),
+    @('LogonId','TargetLogonId','LogonID','LogonId'),@('SessionName','SessionName'),
+    @('SubjectUserSid','SubjectUserSid'),@('TargetSid','TargetUserSid','TargetSid'),@('MemberName','MemberName'),@('MemberSid','MemberSid'),
+    @('Port','IpPort','ClientPort'),@('Workstation','WorkstationName','Workstation','ClientName'),@('SubjectLogonId','SubjectLogonId'),
+    @('SessionID','SessionID','SessionId'),@('Status','Status'),@('SubStatus','SubStatus'),@('Process','ProcessName','NewProcessName','Image'),
+    @('CommandLine','CommandLine'),@('Privileges','PrivilegeList','AccessGranted','AccessRemoved','AccessList'),@('Threat','Threat Name','ThreatName'),
+    @('Path','Path','Resource Path'),@('OldTime','PreviousTime','OldTime'),@('NewTime','NewTime'),@('User','User'),
+    @('TargetServer','TargetServerName'),@('ServiceName','ServiceName','param1'),@('ImagePath','ImagePath','ServiceFileName')
+)
+# Name -> (field key, preference); built once so each event needs one pass over its data.
+$script:FieldIndex=@{}
+foreach ($spec in $script:FieldSpecs) {
+    for ($n=1; $n -lt $spec.Length; $n++) {
+        if (-not $script:FieldIndex.ContainsKey($spec[$n])) { $script:FieldIndex[$spec[$n]]=New-Object 'System.Collections.Generic.List[object]' }
+        $script:FieldIndex[$spec[$n]].Add(@($spec[0],$n))
+    }
+}
+function New-EventRecord([string]$Provider,[string]$IdText,[string]$Channel,[string]$Computer,[string]$RecordId,[string]$LevelText,[string]$SystemTime,[string]$Keywords,$Data,[string]$XmlText,[string]$Recovery) {
+    $time = [DateTimeOffset]::Parse($SystemTime, $script:Invariant)
+    $audit = ''
+    if ($Keywords) {
+        $kw = [Convert]::ToUInt64(($Keywords -replace '^0x',''),16)
+        if (($kw -band [UInt64]4503599627370496) -ne 0) { $audit = 'Failure' }
+        elseif (($kw -band [UInt64]9007199254740992) -ne 0) { $audit = 'Success' }
+    }
+    # Missing keys read as $null (written as empty cells).
+    $f=@{}; $rank=@{}
+    foreach ($entry in $Data.GetEnumerator()) {
+        $targets=$script:FieldIndex[$entry.Key]
+        if ($null -eq $targets) { continue }
+        $v=[string]$entry.Value
+        if ([string]::IsNullOrWhiteSpace($v) -or $v -eq '-') { continue }
+        foreach ($t in $targets) { $k=$t[0]; if (-not $rank.ContainsKey($k) -or $t[1] -lt $rank[$k]) { $f[$k]=$v; $rank[$k]=$t[1] } }
+    }
+    $subject=''; if ($f['SubjectUserName']) { $subject=$f['SubjectUserName']; if ($f['SubjectDomainName']) { $subject=$f['SubjectDomainName']+'\'+$subject } }
+    $target=''; if ($f['TargetUser']) { $target=$f['TargetUser']; if ($f['TargetDomain']) { $target=$f['TargetDomain']+'\'+$target } }
+    return [pscustomobject]@{
+        Provider=$Provider; Id=[int]$IdText
+        Channel=$Channel; Computer=$Computer; RecordId=$RecordId; Level=[int]$LevelText
+        TimeUtc=$time.UtcDateTime.ToString('o',$script:Invariant); Ticks=$time.UtcDateTime.Ticks
+        Data=$Data; F=$f; AuditOutcome=$audit; Xml=$XmlText; XmlRecovery=$Recovery
+        Subject=$subject; Target=$target; SourceIP=[string]$f['SourceIP']; LogonType=[string]$f['LogonType']; LogonId=[string]$f['LogonId']; SessionName=[string]$f['SessionName']
+        Message=''; MessageStatus='NotRequested'; Fingerprint=''
+    }
+}
+# v9.2 fast path: Windows renders event XML in a fixed, simple shape. Regular
+# expressions read System and EventData without building an XmlDocument. Anything
+# unusual (UserData, CDATA, numeric references, control characters, CR, nested
+# elements, attributes on EventData, unknown entities) goes to the full XML parser.
+$script:RxOpt=[Text.RegularExpressions.RegexOptions]::CultureInvariant
+$script:RxHead=New-Object Text.RegularExpressions.Regex('^<Event xmlns=([''"])http://schemas\.microsoft\.com/win/2004/08/events/event\1>',$script:RxOpt)
+$script:RxUnsafe=New-Object Text.RegularExpressions.Regex('[\x00-\x08\x0B\x0C\x0E-\x1F\r￾￿]|<!|&#|<\?|<UserData|<EventData[ /]|&(?!(?:lt|gt|amp|quot|apos);)',$script:RxOpt)
+$script:RxSysItem=New-Object Text.RegularExpressions.Regex('<(Provider|EventID|Level|Keywords|TimeCreated|EventRecordID|Channel|Computer)\b([^>]*?)(?:/>|>([^<]*)</\1>)',$script:RxOpt)
+$script:RxAttrName=New-Object Text.RegularExpressions.Regex('\sName=(?:''([^'']*)''|"([^"]*)")',$script:RxOpt)
+$script:RxAttrTime=New-Object Text.RegularExpressions.Regex('\sSystemTime=(?:''([^'']*)''|"([^"]*)")',$script:RxOpt)
+$script:RxData=New-Object Text.RegularExpressions.Regex('<Data(?: Name=(?:''([^'']*)''|"([^"]*)"))?\s*(?:/>|>([^<]*)</Data>)',$script:RxOpt)
+$script:RxDataRest=New-Object Text.RegularExpressions.Regex('^(?:<Binary>[0-9A-Fa-f]*</Binary>)?$',$script:RxOpt)
+function Parse-EventFast([string]$XmlText) {
+    # Returns $null when the text is not in the simple shape; the caller then uses the XML parser.
+    if (-not $script:RxHead.IsMatch($XmlText) -or $script:RxUnsafe.IsMatch($XmlText)) { return $null }
+    $sysStart=$XmlText.IndexOf('<System>'); $sysEnd=$XmlText.IndexOf('</System>')
+    if ($sysStart -lt 0 -or $sysEnd -lt $sysStart -or $XmlText.IndexOf('<System>',$sysStart+8) -ge 0) { return $null }
+    $sys=$XmlText.Substring($sysStart+8,$sysEnd-$sysStart-8)
+    if ($sys.IndexOf('&') -ge 0) { return $null }
+    $items=@{}
+    foreach ($m in $script:RxSysItem.Matches($sys)) { $tag=$m.Groups[1].Value; if (-not $items.ContainsKey($tag)) { $items[$tag]=$m } }
+    if (-not $items.ContainsKey('Provider') -or -not $items.ContainsKey('EventID') -or -not $items.ContainsKey('TimeCreated') -or -not $items.ContainsKey('Keywords')) { return $null }
+    $pm=$script:RxAttrName.Match($items['Provider'].Groups[2].Value); if (-not $pm.Success) { return $null }
+    $provider=$pm.Groups[1].Value+$pm.Groups[2].Value
+    $tm=$script:RxAttrTime.Match($items['TimeCreated'].Groups[2].Value); if (-not $tm.Success) { return $null }
+    $data=[ordered]@{}
+    $edStart=$XmlText.IndexOf('<EventData>')
+    if ($edStart -ge 0) {
+        $edEnd=$XmlText.IndexOf('</EventData>',$edStart)
+        if ($edEnd -lt 0 -or $XmlText.IndexOf('<EventData>',$edEnd) -ge 0) { return $null }
+        $body=$XmlText.Substring($edStart+11,$edEnd-$edStart-11)
+        $i=0
+        foreach ($m in $script:RxData.Matches($body)) {
+            $name=$m.Groups[1].Value+$m.Groups[2].Value
+            if (-not $name) { $name='Data'+$i }
+            if ($data.Contains($name)) { $name=$name+'#'+$i }
+            $v=$m.Groups[3].Value
+            # Inline entity decoding: a function call per field costs more than the parse itself.
+            if ($v.IndexOf('&') -ge 0) { $v=$v.Replace('&lt;','<').Replace('&gt;','>').Replace('&quot;','"').Replace('&apos;',"'").Replace('&amp;','&') }
+            $data[$name]=$v
+            $i++
+        }
+        if (-not $script:RxDataRest.IsMatch($script:RxData.Replace($body,''))) { return $null }
+    }
+    # System values contain no '&' (checked above), so no entity decoding is needed.
+    $level='0'; $channel=''; $computer=''; $rid=''
+    if ($items.ContainsKey('Level')) { $level=$items['Level'].Groups[3].Value; if (-not $level) { $level='0' } }
+    if ($items.ContainsKey('Channel')) { $channel=$items['Channel'].Groups[3].Value }
+    if ($items.ContainsKey('Computer')) { $computer=$items['Computer'].Groups[3].Value }
+    if ($items.ContainsKey('EventRecordID')) { $rid=$items['EventRecordID'].Groups[3].Value }
+    return New-EventRecord $provider $items['EventID'].Groups[3].Value $channel $computer $rid $level ($tm.Groups[1].Value+$tm.Groups[2].Value) $items['Keywords'].Groups[3].Value $data $XmlText ''
+}
 function Parse-Event([string]$XmlText) {
+    $fast=Parse-EventFast $XmlText
+    if ($null -ne $fast) { return $fast }
+    return Parse-EventDom $XmlText
+}
+function Parse-EventDom([string]$XmlText) {
     $recovery=''
     try { $xml=Read-SafeXml $XmlText }
     catch {
@@ -399,35 +509,18 @@ function Parse-Event([string]$XmlText) {
         $data[$name] = $n.InnerText
         $i++
     }
-    $time = [DateTimeOffset]::Parse($sys.TimeCreated.GetAttribute('SystemTime'), $script:Invariant)
+    $systemTime=$sys.TimeCreated.GetAttribute('SystemTime')
     $keywords = [string]$sys.Keywords
-    $audit = ''
-    if ($keywords) {
-        $kw = [Convert]::ToUInt64(($keywords -replace '^0x',''),16)
-        if (($kw -band [UInt64]4503599627370496) -ne 0) { $audit = 'Failure' }
-        elseif (($kw -band [UInt64]9007199254740992) -ne 0) { $audit = 'Success' }
-    }
     $levelNode = $sys.SelectSingleNode('e:Level',$ns)
     $ridNode = $sys.SelectSingleNode('e:EventRecordID',$ns)
     $channelNode = $sys.SelectSingleNode('e:Channel',$ns)
     $computerNode = $sys.SelectSingleNode('e:Computer',$ns)
-    $level = 0; if ($levelNode) { $level = [int]$levelNode.InnerText }
+    $level = '0'; if ($levelNode) { $level = $levelNode.InnerText; if (-not $level) { $level='0' } }
     $rid = ''; if ($ridNode) { $rid = $ridNode.InnerText }
     $channel = ''; if ($channelNode) { $channel = $channelNode.InnerText }
     $computer = ''; if ($computerNode) { $computer = $computerNode.InnerText }
-    return [pscustomobject]@{
-        Provider=$sys.Provider.GetAttribute('Name'); Id=[int]$sys.SelectSingleNode('e:EventID',$ns).InnerText
-        Channel=$channel; Computer=$computer; RecordId=$rid; Level=$level
-        TimeUtc=$time.UtcDateTime.ToString('o',$script:Invariant); Ticks=$time.UtcDateTime.Ticks
-        Data=$data; AuditOutcome=$audit; Xml=$XmlText; XmlRecovery=$recovery
-        Subject=(Account (Field $data @('SubjectDomainName')) (Field $data @('SubjectUserName')))
-        Target=(Account (Field $data @('TargetDomainName','AccountDomain')) (Field $data @('TargetUserName','AccountName')))
-        SourceIP=(Field $data @('IpAddress','ClientAddress','Address','Param3'))
-        LogonType=(Field $data @('LogonType'))
-        LogonId=(Field $data @('TargetLogonId','LogonID','LogonId'))
-        SessionName=(Field $data @('SessionName'))
-        Message=''; MessageStatus='NotRequested'; Fingerprint=''
-    }
+    $provider=$sys.Provider.GetAttribute('Name'); $idText=$sys.SelectSingleNode('e:EventID',$ns).InnerText
+    return New-EventRecord $provider $idText $channel $computer $rid $level $systemTime $keywords $data $XmlText $recovery
 }
 function Match-Event($e, [bool]$VendorFile) {
     # v9: Event ID above -MaxEventId (default 10000) is never a finding, including
@@ -582,20 +675,25 @@ function Save-Finding($e,$r,$file,[string]$EvidencePath) {
     $message=$e.Message
     if ($message.Length -gt 8000) { $message=$message.Substring(0,8000)+' [обрезано; полный текст смотрите в исходном EVTX или техническом Evidence при -KeepTechnicalFiles]' }
     $delta=''
-    $old=Field $d @('PreviousTime','OldTime'); $new=Field $d @('NewTime')
+    $f=$e.F
+    $old=$f['OldTime']; $new=$f['NewTime']
     if ($old -and $new) {
         try { $delta=([DateTimeOffset]::Parse($new,$script:Invariant)-[DateTimeOffset]::Parse($old,$script:Invariant)).TotalSeconds.ToString('0.#######',$script:Invariant) } catch { $delta='Unparsed' }
     }
-    Write-Row $script:FindingWriter @($id,$e.Id,$e.RecordId,(Ru-Severity $r.Severity),$r.Category,$r.Title,$r.Note,$e.TimeUtc,$e.Computer,
-        $file.DirectoryName,$file.Name,$file.FullName,$e.Channel,$e.Provider,$e.Level,(Ru-AuditOutcome $e.AuditOutcome),
-        $e.Subject,(Field $d @('SubjectUserSid')),$e.Target,(Field $d @('TargetUserSid','TargetSid')),
-        (Field $d @('MemberName')),(Field $d @('MemberSid')),$e.SourceIP,(Field $d @('IpPort','ClientPort')),
-        (Field $d @('WorkstationName','Workstation','ClientName')),$e.LogonType,$e.LogonId,
-        (Field $d @('SubjectLogonId')),(Field $d @('SessionID','SessionId')),$e.SessionName,
-        (Field $d @('Status')),(Field $d @('SubStatus')),(Field $d @('ProcessName','NewProcessName','Image')),
-        (Field $d @('CommandLine')),(Field $d @('PrivilegeList','AccessGranted','AccessRemoved','AccessList')),
-        (Field $d @('Threat Name','ThreatName')),(Field $d @('Path','Resource Path')),
-        $old,$new,$delta,$details,$message,(Ru-MessageStatus $e.MessageStatus),$r.RuleId,$e.Fingerprint,$e.XmlRecovery)
+    # Table lookups instead of three Ru-* function calls per finding.
+    $sevText=$script:RuSeverityMap[$r.Severity]; if ($null -eq $sevText) { $sevText=$r.Severity }
+    $auditText=$script:RuAuditMap[$e.AuditOutcome]; if ($null -eq $auditText) { $auditText=$e.AuditOutcome }
+    $msgText=$script:RuMessageMap[$e.MessageStatus]; if ($null -eq $msgText) { $msgText=$e.MessageStatus }
+    Write-Row $script:FindingWriter @($id,$e.Id,$e.RecordId,$sevText,$r.Category,$r.Title,$r.Note,$e.TimeUtc,$e.Computer,
+        $file.DirectoryName,$file.Name,$file.FullName,$e.Channel,$e.Provider,$e.Level,$auditText,
+        $e.Subject,$f['SubjectUserSid'],$e.Target,$f['TargetSid'],
+        $f['MemberName'],$f['MemberSid'],$e.SourceIP,$f['Port'],
+        $f['Workstation'],$e.LogonType,$e.LogonId,
+        $f['SubjectLogonId'],$f['SessionID'],$e.SessionName,
+        $f['Status'],$f['SubStatus'],$f['Process'],
+        $f['CommandLine'],$f['Privileges'],
+        $f['Threat'],$f['Path'],
+        $old,$new,$delta,$details,$message,$msgText,$r.RuleId,$e.Fingerprint,$e.XmlRecovery)
     if ($script:EvidenceWriter) {
         $script:EvidenceWriter.WriteLine(([ordered]@{FindingId=$id;SourceFile=$file.FullName;RuleId=$r.RuleId;
             Fingerprint=$e.Fingerprint;Xml=$e.Xml;Message=$e.Message;MessageStatus=$e.MessageStatus} | ConvertTo-Json -Depth 6 -Compress))
@@ -693,14 +791,14 @@ function Handle-Rdp($e,$state,[string]$File,[long]$FindingId) {
     }
     if (-not $e.Computer) { return }
     if ($e.Provider -eq $script:LsmProvider) {
-        $session=Field $e.Data @('SessionID','SessionId')
+        $session=$e.F['SessionID']
         if (-not $session -or $e.Id -notin @(21,23,24,25)) { return }
         $address=$e.SourceIP
         $remote=$address -and $address -notin @('LOCAL','127.0.0.1','::1')
         $isStart=$e.Id -in @(21,25)
         if ($isStart -and -not $remote) { return }  # console / local session
         $key=$e.Computer.ToLowerInvariant()+'|lsm|'+$session
-        $point=[pscustomobject]@{File=$File;Computer=$e.Computer;Target=(Field $e.Data @('User'));LogonId=('Session '+$session);SourceIP=$address;
+        $point=[pscustomobject]@{File=$File;Computer=$e.Computer;Target=$e.F['User'];LogonId=('Session '+$session);SourceIP=$address;
             TimeUtc=$e.TimeUtc;Ticks=$e.Ticks;RecordId=$e.RecordId;FindingId=$FindingId;Id=$e.Id;Source='TerminalServices-LocalSessionManager'}
         Handle-RdpPoint $state $key $point $isStart ($e.Id -eq 24 -and $remote) 'Интервал по TerminalServices-LocalSessionManager (Session ID): от входа/переподключения до выхода/отключения, не активность пользователя.'
         return
@@ -735,12 +833,12 @@ function Save-Failure($e,$file,[long]$FindingId,$spoolWriters) {
     }
     $source=$e.SourceIP
     if ($source -match '^::ffff:') { $source=$source.Substring(7) }
-    if (-not $source -or $source -eq '-') { $source=Field $e.Data @('WorkstationName','Workstation','ClientName') }
+    if (-not $source -or $source -eq '-') { $source=$e.F['Workstation'] }
     if (-not $source) { $source='[unknown]' }
     $account=$e.Target; if (-not $account) { $account='[unknown]' }
     $spoolWriters[$partition].WriteLine(([ordered]@{Ticks=$e.Ticks;TimeUtc=$e.TimeUtc;Computer=$e.Computer;Scope=$scope;
         EventId=$e.Id;Account=$account;Source=$source;Fingerprint=$e.Fingerprint;FindingId=$FindingId;
-        File=$file.FullName;RecordId=$e.RecordId;Status=(Field $e.Data @('Status'));SubStatus=(Field $e.Data @('SubStatus'))} | ConvertTo-Json -Compress))
+        File=$file.FullName;RecordId=$e.RecordId;Status=$e.F['Status'];SubStatus=$e.F['SubStatus']} | ConvertTo-Json -Compress))
 }
 function Save-Burst($queue,[string]$Mode) {
     $items=@($queue.ToArray())
@@ -1964,6 +2062,45 @@ function Test-V9 {
     }
     Write-Host 'V9 SelfTest OK'
 }
+function Test-V92Parse {
+    $sec='Microsoft-Windows-Security-Auditing'
+    $ns='http://schemas.microsoft.com/win/2004/08/events/event'
+    # Windows ToXml() shape: single quotes, Qualifiers, Security/Execution elements, Binary.
+    $win="<Event xmlns='$ns'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4624</EventID><Version>2</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2026-03-01T08:09:10.1234567Z'/><EventRecordID>123456</EventRecordID><Correlation ActivityID='{11111111-2222-3333-4444-555555555555}'/><Execution ProcessID='700' ThreadID='800'/><Channel>Security</Channel><Computer>srv01.lab.local</Computer><Security/></System><EventData><Data Name='SubjectUserSid'>S-1-5-18</Data><Data Name='SubjectUserName'>SRV01$</Data><Data Name='SubjectDomainName'>LAB</Data><Data Name='TargetUserName'>alice</Data><Data Name='TargetDomainName'>LAB</Data><Data Name='TargetLogonId'>0x1a2b</Data><Data Name='LogonType'>10</Data><Data Name='IpAddress'>203.0.113.5</Data><Data Name='IpPort'>51234</Data><Data Name='ProcessName'>C:\Windows\System32\svchost.exe</Data><Data Name='Empty'></Data><Data Name='Dash'>-</Data><Data Name='SelfClosed'/><Data Name='Ent'>a &amp; b &lt;c&gt; &quot;d&quot; &apos;e&apos; &amp;lt;</Data><Data>unnamed</Data><Data Name='LogonType'>dup</Data></EventData></Event>"
+    $samples=@(
+        $win,
+        $win.Replace("<Data Name='Empty'></Data>","<Data Name='Empty'></Data><Binary>0A0B</Binary>"),
+        (Test-Xml 4625 $sec '<EventData><Data Name="TargetUserName">a</Data><Data Name="Status">0xc000006d</Data></EventData>' '0x8010000000000000'),
+        (Test-Xml 7045 'Service Control Manager' '<EventData><Data Name="ServiceName">x</Data><Data Name="ImagePath">%COMSPEC% /c echo 1 &gt; \\127.0.0.1\C$\o</Data></EventData>'),
+        (Test-Xml 1102 'Microsoft-Windows-Eventlog' '<UserData><LogFileCleared xmlns="urn:t"><SubjectUserName>alice</SubjectUserName></LogFileCleared></UserData>'),
+        (Test-Xml 1000 'Application Error' ('<EventData><Data Name="V">A'+[char]16+'B</Data></EventData>')),
+        (Test-Xml 1000 'Application Error' "<EventData><Data Name=`"V`">line1`r`nline2</Data></EventData>"),
+        (Test-Xml 1000 'Application Error' '<EventData><Data Name="V">&#x41;</Data></EventData>'),
+        (Test-Xml 1000 'Application Error' '<EventData><Data Name="V"><![CDATA[x]]></Data></EventData>'),
+        (Test-Xml 1000 'Application Error' '<EventData><Data Name="V"><Sub>x</Sub></Data></EventData>'),
+        (Test-Xml 1000 'Application Error' '<EventData Name="x"><Data Name="V">1</Data></EventData>'),
+        (Test-Xml 1000 'Application Error' '<EventData><Data Name="V">1</Data><ComplexData>2</ComplexData></EventData>'),
+        (Test-Xml 1000 'Application Error' '')
+    )
+    $fastCount=0
+    foreach ($xmlText in $samples) {
+        $dom=Parse-EventDom $xmlText; $fast=Parse-EventFast $xmlText
+        if ($null -eq $fast) { $fast=Parse-Event $xmlText } else { $fastCount++ }
+        $same=$true
+        foreach ($p in $dom.PSObject.Properties) {
+            if ($p.Name -in @('Data','F')) { continue }
+            if ([string]$fast.($p.Name) -cne [string]$p.Value) { $same=$false; Write-Host ('  differs: '+$p.Name) }
+        }
+        if ((@($fast.Data.Keys) -join '|') -cne (@($dom.Data.Keys) -join '|') -or (@($fast.Data.Values) -join '|') -cne (@($dom.Data.Values) -join '|')) { $same=$false; Write-Host '  differs: Data' }
+        foreach ($spec in $script:FieldSpecs) { $k=$spec[0]; if ([string]$fast.F[$k] -cne [string]$dom.F[$k]) { $same=$false; Write-Host ('  differs: F.'+$k) } }
+        foreach ($spec in $script:FieldSpecs) { if ([string]$dom.F[$spec[0]] -cne (Field $dom.Data ([string[]]($spec | Select-Object -Skip 1)))) { $same=$false; Write-Host ('  F differs from Field: '+$spec[0]) } }
+        Assert-True $same ('v9.2 fast parser equals XML parser: '+$dom.Provider+'/'+$dom.Id+' '+$dom.Data.Count+' fields')
+    }
+    Assert-True ($fastCount -eq 5) ('v9.2 simple events use the fast path, unusual ones the XML parser (fast='+$fastCount+')')
+    $rejected=$false
+    try { $null=Parse-Event ((Test-Xml 1000 'Application Error' '<EventData><Data Name="V">ok</Data></EventData>').Replace('</EventData>','')) } catch { $rejected=$true }
+    Assert-True $rejected 'v9.2 malformed XML still rejected'
+}
 if ($SelfTest) {
     # Fixtures use deterministic thresholds, independent of scan parameters.
     $FailureThreshold=10; $WindowMinutes=10; $TriageWindowMinutes=30; $SprayUserThreshold=5
@@ -1976,6 +2113,7 @@ if ($SelfTest) {
     Test-V8
     Test-V81
     Test-V9
+    Test-V92Parse
     Write-Host ('ALL SELFTESTS PASSED — version '+$script:Version)
     } finally { $script:HashEngine.Dispose() }
     return
