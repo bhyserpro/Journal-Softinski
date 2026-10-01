@@ -2,7 +2,7 @@
 <#
 Offline EVTX triage. Windows PowerShell 5.1, built-in .NET only.
 Reads supplied files; never changes logs, accounts, audit policy or execution policy.
-See README-RU-v8.1.md for semantics, limitations and validation status.
+See README.md for semantics, limitations and validation status.
 #>
 [CmdletBinding()]
 param(
@@ -16,6 +16,10 @@ param(
     [char]$Delimiter = ';',
     [switch]$IncludeMessages,
     [switch]$IncludeNoise,
+    [switch]$IncludeAllErrors,
+    [ValidateRange(1,65535)][int]$MaxEventId = 10000,
+    [datetime]$StartTime,
+    [datetime]$EndTime,
     [switch]$SkipMessages,
     [switch]$IncludeNetworkLogons,
     [switch]$DeepScriptScan,
@@ -32,7 +36,7 @@ param(
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$script:Version = '8.1.0'
+$script:Version = '9.0.0'
 $script:Utf8 = New-Object System.Text.UTF8Encoding($true)
 $script:Invariant = [Globalization.CultureInfo]::InvariantCulture
 $script:FastCellInvalid=New-Object Text.RegularExpressions.Regex('[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]')
@@ -161,12 +165,59 @@ Microsoft-Windows-TaskScheduler	106	Закрепление / запуск	Medium
 Microsoft-Windows-TaskScheduler	140	Закрепление / запуск	Medium	Обновлено задание планировщика	Дополнительный источник к Security 4698/4702/4699; проверить задание.
 Microsoft-Windows-TaskScheduler	141	Закрепление / запуск	Medium	Удалено задание планировщика	Дополнительный источник к Security 4698/4702/4699; проверить задание.
 '@ | ConvertFrom-Csv -Delimiter "`t"
-if (-not $IncludeNoise) {
-    $script:RuleTable=@($script:RuleTable | Where-Object {
-        -not ($_.Provider -eq 'Windows Error Reporting' -and $_.Id -eq '1001')
-    })
-}
+# v9: default rule set keeps only security-relevant, low/medium-volume events.
+# The rules below are high-volume or purely operational; -IncludeNoise returns them.
+$script:NoiseRules = [System.Collections.Generic.HashSet[string]]::new([string[]]@(
+    'Microsoft-Windows-Security-Auditing|4670',  # object permissions: very noisy with Object Access audit
+    'Microsoft-Windows-Security-Auditing|4672',  # special privileges at logon: context only, one per admin/service logon
+    'Microsoft-Windows-Security-Auditing|4700',
+    'Microsoft-Windows-Security-Auditing|4701',
+    'Microsoft-Windows-Security-Auditing|4705',
+    'Microsoft-Windows-Security-Auditing|4718',
+    'Microsoft-Windows-Security-Auditing|4742',  # computer account changed: machine password rotation on DCs
+    'Microsoft-Windows-Security-Auditing|4767',
+    'Microsoft-Windows-Security-Auditing|4902',
+    'Microsoft-Windows-Security-Auditing|4911',
+    'Microsoft-Windows-Security-Auditing|4913',
+    'Microsoft-Windows-Security-Auditing|4950',
+    'Microsoft-Windows-Security-Auditing|4954',  # firewall GPO refresh
+    'Microsoft-Windows-Kernel-General|1',         # time sync; Security 4616 is the security signal
+    'Microsoft-Windows-Kernel-General|12',
+    'Microsoft-Windows-Kernel-General|13',
+    'EventLog|6005',
+    'EventLog|6006',
+    'Service Control Manager|7000',
+    'Service Control Manager|7001',
+    'Service Control Manager|7011',
+    'Service Control Manager|7023',
+    'Service Control Manager|7024',
+    'Service Control Manager|7031',
+    'Service Control Manager|7034',
+    'Application Error|1000',
+    'Windows Error Reporting|1001',
+    'Microsoft-Windows-Windows Defender|1013',
+    'Microsoft-Windows-TerminalServices-LocalSessionManager|22',
+    'Microsoft-Windows-Sysmon|6',
+    'Microsoft-Windows-TaskScheduler|140'
+))
+# Generic "any Critical/Error event" rule: opt-in, it dominates System/Application volume.
+$script:GenericErrors = [bool]($IncludeNoise -or $IncludeAllErrors)
+$script:RuleTable=@($script:RuleTable | Where-Object {
+    [int]$_.Id -le $MaxEventId -and ($IncludeNoise -or -not $script:NoiseRules.Contains($_.Provider + '|' + $_.Id))
+})
 foreach ($r in $script:RuleTable) { $script:Rules[($r.Provider + '|' + $r.Id)] = $r }
+# Events that can influence RDP pairing / failure correlation; other events skip those calls.
+$script:RdpRelevant = [System.Collections.Generic.HashSet[string]]::new([string[]]@(
+    'Microsoft-Windows-Security-Auditing|4608','Microsoft-Windows-Security-Auditing|4616',
+    'Microsoft-Windows-Security-Auditing|4624','Microsoft-Windows-Security-Auditing|4634',
+    'Microsoft-Windows-Security-Auditing|4778','Microsoft-Windows-Security-Auditing|4779',
+    'Microsoft-Windows-Eventlog|1102'))
+$script:FailureIds=@(4625,4771,4776)
+$script:HasStart=$PSBoundParameters.ContainsKey('StartTime')
+$script:HasEnd=$PSBoundParameters.ContainsKey('EndTime')
+$script:StartTicks=[long]0; $script:EndTicks=[DateTime]::MaxValue.Ticks
+if ($script:HasStart) { $script:StartTicks=$StartTime.ToUniversalTime().Ticks }
+if ($script:HasEnd) { $script:EndTicks=$EndTime.ToUniversalTime().Ticks }
 
 function New-Writer([string]$Path, [bool]$Append = $false) {
     $w = New-Object System.IO.StreamWriter($Path, $Append, $script:Utf8, 65536)
@@ -376,6 +427,9 @@ function Parse-Event([string]$XmlText) {
     }
 }
 function Match-Event($e, [bool]$VendorFile) {
+    # v9: Event ID above -MaxEventId (default 10000) is never a finding, including
+    # the full-scan fallback and third-party AV logs.
+    if ($e.Id -gt $MaxEventId) { return }
     $key = $e.Provider + '|' + $e.Id
     $r = $null
     if ($script:Rules.ContainsKey($key)) {
@@ -431,47 +485,57 @@ function Match-Event($e, [bool]$VendorFile) {
             $r = [pscustomobject]@{Category='Антивирус: ручная проверка';Severity='Info';Title='Событие стороннего антивируса';Note='Включен -IncludeAllAntivirusEvents. Точное значение Event ID зависит от продукта/версии.';RuleId='AV-VENDOR-REVIEW'}
         }
     }
-    if ($null -eq $r -and $e.Level -in @(1,2)) {
+    if ($null -eq $r -and $script:GenericErrors -and $e.Level -in @(1,2)) {
         $severity='Medium'; if ($e.Level -eq 1) { $severity='High' }
         $r=[pscustomobject]@{Category='Сбои';Severity=$severity;Title='Событие уровня Critical/Error';Note='Операционная неисправность; связь с ИБ требует отдельной проверки.';RuleId='GENERIC-LEVEL-'+$e.Level}
     }
     return $r
 }
 function Build-Query([string]$Path, [bool]$VendorFile) {
-    $queryKey=([string]$VendorFile)+'|'+$IncludeNoise+'|'+$IncludeNetworkLogons+'|'+$DeepScriptScan+'|'+$IncludeProcessCreation
+    $queryKey=([string]$VendorFile)+'|'+$IncludeNoise+'|'+$IncludeNetworkLogons+'|'+$DeepScriptScan+'|'+$IncludeProcessCreation+'|'+$script:GenericErrors+'|'+$MaxEventId+'|'+$script:StartTicks+'|'+$script:EndTicks
     if ($script:QueryCache.ContainsKey($queryKey)) { return $script:QueryCache[$queryKey] }
+    # v9: the optional time window is applied inside System[], so Windows skips those
+    # records before ToXml/PowerShell. Rule selectors list explicit IDs (already
+    # <= MaxEventId); only the wildcard selectors need an explicit EventID limit.
+    # Terms are kept few: a rejected query falls back to a much slower full scan.
+    $common='EventID<='+$MaxEventId
+    $time=''
+    if ($script:HasStart) { $time+=" and TimeCreated[@SystemTime>='"+([DateTime]::new($script:StartTicks,[DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ',$script:Invariant))+"']" }
+    if ($script:HasEnd) { $time+=" and TimeCreated[@SystemTime<='"+([DateTime]::new($script:EndTicks,[DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ',$script:Invariant))+"']" }
+    $common+=$time
     $selectors = New-Object 'System.Collections.Generic.List[string]'
     if ($VendorFile) {
         # For named AV exports inspect every record. A structured QueryList is
         # retained so the same reader path can be used for all rule selectors.
-        $selectors.Add('*')
+        $selectors.Add("*[System[$common]]")
     } else {
-        $selectors.Add('*[System[(Level=1 or Level=2)]]')
+    if ($script:GenericErrors) { $selectors.Add("*[System[(Level=1 or Level=2) and $common]]") }
     $groups = $script:RuleTable | Group-Object Provider
     foreach ($g in $groups) {
-        $excludedSecurityIds=@(4624,4634)
-        if (-not $IncludeNoise) { $excludedSecurityIds+=4672 }
+        # 4624/4634 need LogonType, 4776 needs Status: dedicated selectors below.
+        $excludedSecurityIds=@(4624,4634,4776)
         $ids = @($g.Group | Where-Object { $_.Provider -ne 'Microsoft-Windows-Security-Auditing' -or [int]$_.Id -notin $excludedSecurityIds } | ForEach-Object { [int]$_.Id })
         # Short selectors keep each XPath below Windows Event Log complexity limits.
         for ($i=0; $i -lt $ids.Count; $i+=8) {
             $last = [Math]::Min($i+7,$ids.Count-1)
             $parts = @($ids[$i..$last] | ForEach-Object { 'EventID=' + $_ })
-            $selectors.Add("*[System[Provider[@Name='$($g.Name)'] and ($($parts -join ' or '))]]")
+            $selectors.Add("*[System[Provider[@Name='$($g.Name)'] and ($($parts -join ' or '))$time]]")
         }
     }
-    $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and (EventID=4624 or EventID=4634)] and EventData[Data[@Name='LogonType']='10']]")
-    if (-not $IncludeNoise) {
-        $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4672] and EventData[Data[@Name='SubjectUserSid']!='S-1-5-18' and Data[@Name='SubjectUserSid']!='S-1-5-19' and Data[@Name='SubjectUserSid']!='S-1-5-20']]")
+    $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and (EventID=4624 or EventID=4634)$time] and EventData[Data[@Name='LogonType']='10']]")
+    if ($script:Rules.ContainsKey('Microsoft-Windows-Security-Auditing|4776')) {
+        # Successful NTLM validations (Status 0x0) are the bulk of 4776 on DCs and are never findings.
+        $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4776$time] and EventData[Data[@Name='Status']!='0x0']]")
     }
     if ($IncludeNetworkLogons) {
-        $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4624] and EventData[(Data[@Name='LogonType']='3' or Data[@Name='LogonType']='8')]]")
+        $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4624$time] and EventData[(Data[@Name='LogonType']='3' or Data[@Name='LogonType']='8')]]")
     }
     if ($DeepScriptScan) {
-        $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-PowerShell'] and EventID=4104]]")
+        $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-PowerShell'] and EventID=4104$time]]")
     }
     if ($IncludeProcessCreation) {
-        $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4688]]")
-        $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Sysmon'] and EventID=1]]")
+        $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4688$time]]")
+        $selectors.Add("*[System[Provider[@Name='Microsoft-Windows-Sysmon'] and EventID=1$time]]")
     }
     }
     # The source file is supplied through EventLogQuery.Path with PathType=FilePath.
@@ -815,6 +879,11 @@ function New-RunSummaryCsv([string]$WorkPath) {
             [pscustomobject]@{Label='Порог отказов';Value=$run.Parameters.FailureThreshold},
             [pscustomobject]@{Label='Окно отказов, мин';Value=$run.Parameters.WindowMinutes},
             [pscustomobject]@{Label='Порог разных УЗ для spraying';Value=$run.Parameters.SprayUserThreshold},
+            [pscustomobject]@{Label='Максимальный Event ID';Value=$run.Parameters.MaxEventId},
+            [pscustomobject]@{Label='Период: начало UTC';Value=$run.Parameters.StartTimeUtc},
+            [pscustomobject]@{Label='Период: конец UTC';Value=$run.Parameters.EndTimeUtc},
+            [pscustomobject]@{Label='IncludeNoise';Value=$run.Parameters.IncludeNoise},
+            [pscustomobject]@{Label='IncludeAllErrors';Value=$run.Parameters.IncludeAllErrors},
             [pscustomobject]@{Label='DeepScriptScan';Value=$run.Parameters.DeepScriptScan},
             [pscustomobject]@{Label='IncludeProcessCreation';Value=$run.Parameters.IncludeProcessCreation},
             [pscustomobject]@{Label='IncludeNetworkLogons';Value=$run.Parameters.IncludeNetworkLogons},
@@ -1416,6 +1485,7 @@ function Write-TriageFallback([string]$WorkPath,[string]$Reason) {
     $emptyGroups=@{}
     Write-TriageReport $WorkPath $emptyGroups 0 0 0 0 ('Не удалось полностью сформировать приоритеты: '+$Reason)
 }
+$script:TriageColumns=@('Номер','Event ID','Record ID','Время UTC','Папка источника','Полный путь','Компьютер','Провайдер','Результат аудита','SID целевой УЗ','SID участника','SID инициатора','Logon ID цели','Logon ID инициатора','Тип входа','Целевая УЗ','IP источника','Status','SubStatus','Данные события','Командная строка','Процесс','SHA256 XML события','Восстановление XML')
 function Build-Triage([string]$WorkPath) {
     $script:TriageIncomplete=$false
     $script:TriageHasErrors=$false
@@ -1440,7 +1510,10 @@ function Build-Triage([string]$WorkPath) {
                                 if (-not $limitWarned) { Log-Issue 'Triage' $WorkPath '' 'Достигнут общий лимит 100000 уникальных кандидатов. Области с пропущенными кандидатами исключены из цепочек. Повторите анализ отдельных папок компьютеров; базовые отчеты и отдельные приоритеты сохранены.'; $limitWarned=$true }
                             } else {
                                 if (-not $scopes.ContainsKey($scope)) { $scopes[$scope]=New-Object 'System.Collections.Generic.List[object]' }
-                                [void]$scopes[$scope].Add(($r | Select-Object 'Номер','Event ID','Record ID','Время UTC','Папка источника','Полный путь','Компьютер','Провайдер','Результат аудита','SID целевой УЗ','SID участника','SID инициатора','Logon ID цели','Logon ID инициатора','Тип входа','Целевая УЗ','IP источника','Status','SubStatus','Данные события','Командная строка','Процесс','SHA256 XML события','Восстановление XML'))
+                                # v9: direct projection instead of one Select-Object pipeline per row.
+                                $projection=[ordered]@{}
+                                foreach ($column in $script:TriageColumns) { $property=$r.PSObject.Properties[$column]; if ($property) { $projection[$column]=$property.Value } else { $projection[$column]=$null } }
+                                [void]$scopes[$scope].Add([pscustomobject]$projection)
                                 $candidateCount++
                             }
                         }
@@ -1662,7 +1735,7 @@ function Test-V8 {
         $serviceLogon=Parse-Event (Test-Xml 4672 $sec '<EventData><Data Name="SubjectUserSid">S-1-5-18</Data></EventData>')
         Assert-True ($null -eq (Match-Event $serviceLogon $false)) 'v8 SYSTEM 4672 excluded'
         $serviceLogon.Data['SubjectUserSid']='S-1-5-21-1-2-3-1001'
-        Assert-True ($null -ne (Match-Event $serviceLogon $false)) 'v8 user 4672 retained'
+        Assert-True ($null -eq (Match-Event $serviceLogon $false)) 'v9 user 4672 is noise by default (-IncludeNoise returns it)'
         Assert-True (-not $script:Rules.ContainsKey('Windows Error Reporting|1001')) 'v8 optional WER 1001 excluded'
         Assert-True ($script:Rules.ContainsKey('Microsoft-Windows-WER-SystemErrorReporting|1001')) 'v8 BugCheck 1001 retained'
     }
@@ -1712,6 +1785,34 @@ function Test-V81 {
         Assert-True ([IO.File]::ReadAllText($referencePath) -ceq [IO.File]::ReadAllText($fastPath)) 'v8.1 complete burst CSV equals v8 reference (expiry, duplicates, cleanup)'
     } finally { Remove-Item -LiteralPath $tmp -Recurse -Force }
 }
+function Test-V9 {
+    $sec='Microsoft-Windows-Security-Auditing'
+    # Event ID limit and trimmed rule set.
+    Assert-True (@($script:RuleTable | Where-Object { [int]$_.Id -gt $MaxEventId }).Count -eq 0) 'v9 no rule above MaxEventId'
+    $e=Parse-Event (Test-Xml 10016 'Microsoft-Windows-DistributedCOM' '<EventData><Data Name="x">1</Data></EventData>')
+    $e.Level=2
+    Assert-True ($null -eq (Match-Event $e $false)) 'v9 Event ID above 10000 is not a finding'
+    Assert-True ($null -eq (Match-Event $e $true)) 'v9 Event ID above 10000 ignored in AV vendor logs too'
+    $e=Parse-Event (Test-Xml 999 'Some-Provider' '<EventData><Data Name="x">1</Data></EventData>'); $e.Level=2
+    Assert-True (($null -ne (Match-Event $e $false)) -eq $script:GenericErrors) 'v9 generic Critical/Error rule follows -IncludeAllErrors'
+    if (-not $IncludeNoise) {
+        foreach ($k in @('Microsoft-Windows-Security-Auditing|4670','Service Control Manager|7036','Application Error|1000','Microsoft-Windows-Sysmon|6')) {
+            Assert-True (-not $script:Rules.ContainsKey($k)) ('v9 noise rule excluded: '+$k)
+        }
+    }
+    foreach ($k in @('Microsoft-Windows-Security-Auditing|4625','Microsoft-Windows-Security-Auditing|4720','Microsoft-Windows-Security-Auditing|4732','Microsoft-Windows-Eventlog|1102','Service Control Manager|7045','Microsoft-Windows-Windows Defender|1116','Microsoft-Windows-Security-Auditing|4698')) {
+        if ([int]$k.Split('|')[1] -gt $MaxEventId) { continue }
+        Assert-True ($script:Rules.ContainsKey($k)) ('v9 key rule retained: '+$k)
+    }
+    $query=Build-Query 'C:\x\Security.evtx' $false
+    $doc=New-Object Xml.XmlDocument; $doc.LoadXml($query)
+    $selects=@($doc.SelectNodes("//Select") | ForEach-Object { $_.InnerText })
+    Assert-True (@($selects | Where-Object { $_ -notmatch "EventID=\d|EventID<=$MaxEventId" }).Count -eq 0) 'v9 every selector has explicit IDs or the MaxEventId limit'
+    Assert-True (@((Build-Query 'C:\x\kaspersky.evtx' $true) -split '<Select>' | Where-Object { $_ -like '*</Select>*' -and $_ -notlike "*EventID&lt;=$MaxEventId*" }).Count -eq 0) 'v9 AV vendor selector limited by MaxEventId'
+    Assert-True (@($selects | Where-Object { $_ -like "*EventID=4776*Status']!='0x0'*" }).Count -eq 1) 'v9 successful 4776 filtered by Windows API'
+    Assert-True (@($selects | Where-Object { $_ -match '(^|[^<>!])EventID=4776 or|or EventID=4776\)' }).Count -eq 0) 'v9 4776 not selected unfiltered'
+    Write-Host 'V9 SelfTest OK'
+}
 if ($SelfTest) {
     # Fixtures use deterministic thresholds, independent of scan parameters.
     $FailureThreshold=10; $WindowMinutes=10; $TriageWindowMinutes=30; $SprayUserThreshold=5
@@ -1723,7 +1824,8 @@ if ($SelfTest) {
     Test-V4
     Test-V8
     Test-V81
-    Write-Host 'ALL SELFTESTS PASSED — version 8.1.0'
+    Test-V9
+    Write-Host ('ALL SELFTESTS PASSED — version '+$script:Version)
     } finally { $script:HashEngine.Dispose() }
     return
 }
@@ -1733,6 +1835,7 @@ if ([string]::IsNullOrWhiteSpace($InputPath)) { throw 'Укажите -InputPath
 $inputItem=Get-Item -LiteralPath $InputPath
 if (-not $inputItem.PSIsContainer -and $inputItem.Extension -ne '.evtx') { throw 'Входной файл должен иметь расширение .evtx.' }
 if ($Delimiter -in @('"',"`r","`n")) { throw 'Недопустимый разделитель CSV.' }
+if ($script:HasStart -and $script:HasEnd -and $script:StartTicks -gt $script:EndTicks) { throw 'StartTime должен быть не позже EndTime.' }
 if ($IncludeMessages -and $SkipMessages) { throw 'Нельзя одновременно указывать -IncludeMessages и -SkipMessages.' }
 # Rendering localized descriptions can dominate the runtime for offline EVTX
 # because Windows loads provider resources for every selected event. XML fields
@@ -1762,7 +1865,7 @@ New-FindingFile
 $runStatus='Running'; $files=@(); $processed=0; $warningFiles=0; $failedFiles=0; $processingWarnings=0; $correlationErrors=0; $fatalError=$null
 $metaPath=Join-Path $script:RunPath 'Run.json'
 $metadata=[ordered]@{ScriptVersion=$script:Version;StartedUtc=$started.ToString('o');FinishedUtc=$null;Status='Running';InputPath=$inputItem.FullName;OutputPath=$outputRoot;
-    PowerShell=$PSVersionTable.PSVersion.ToString();Parameters=[ordered]@{FailureThreshold=$FailureThreshold;WindowMinutes=$WindowMinutes;SprayUserThreshold=$SprayUserThreshold;MaxRdpHours=$MaxRdpHours;RowsPerCsv=$RowsPerCsv;Delimiter=[string]$Delimiter;IncludeNoise=[bool]$IncludeNoise;IncludeMessages=[bool]$script:FormatMessages;SkipMessages=[bool]$SkipMessages;IncludeNetworkLogons=[bool]$IncludeNetworkLogons;DeepScriptScan=[bool]$DeepScriptScan;IncludeProcessCreation=[bool]$IncludeProcessCreation;HashFiles=[bool]$HashFiles;SkipCorrelation=[bool]$SkipCorrelation;SkipTriage=[bool]$SkipTriage;TriageWindowMinutes=$TriageWindowMinutes;NoExcel=[bool]$NoExcel;KeepTechnicalFiles=[bool]$KeepTechnicalFiles;IncludeAllAntivirusEvents=[bool]$IncludeAllAntivirusEvents;ExtraAvFilePattern=$ExtraAvFilePattern};FilesDiscovered=0;FilesProcessed=0;WarningFiles=0;FailedOrPartialFiles=0;Findings=0;RdpRows=0;AuthBursts=0;Issues=0;ProcessingWarnings=0;CorrelationErrors=0}
+    PowerShell=$PSVersionTable.PSVersion.ToString();Parameters=[ordered]@{FailureThreshold=$FailureThreshold;WindowMinutes=$WindowMinutes;SprayUserThreshold=$SprayUserThreshold;MaxRdpHours=$MaxRdpHours;RowsPerCsv=$RowsPerCsv;Delimiter=[string]$Delimiter;IncludeNoise=[bool]$IncludeNoise;IncludeAllErrors=[bool]$IncludeAllErrors;MaxEventId=$MaxEventId;StartTimeUtc=$(if($script:HasStart){$StartTime.ToUniversalTime().ToString('o')}else{''});EndTimeUtc=$(if($script:HasEnd){$EndTime.ToUniversalTime().ToString('o')}else{''});IncludeMessages=[bool]$script:FormatMessages;SkipMessages=[bool]$SkipMessages;IncludeNetworkLogons=[bool]$IncludeNetworkLogons;DeepScriptScan=[bool]$DeepScriptScan;IncludeProcessCreation=[bool]$IncludeProcessCreation;HashFiles=[bool]$HashFiles;SkipCorrelation=[bool]$SkipCorrelation;SkipTriage=[bool]$SkipTriage;TriageWindowMinutes=$TriageWindowMinutes;NoExcel=[bool]$NoExcel;KeepTechnicalFiles=[bool]$KeepTechnicalFiles;IncludeAllAntivirusEvents=[bool]$IncludeAllAntivirusEvents;ExtraAvFilePattern=$ExtraAvFilePattern};FilesDiscovered=0;FilesProcessed=0;WarningFiles=0;FailedOrPartialFiles=0;Findings=0;RdpRows=0;AuthBursts=0;Issues=0;ProcessingWarnings=0;CorrelationErrors=0}
 [IO.File]::WriteAllText($metaPath,($metadata|ConvertTo-Json -Depth 6),$script:Utf8)
 try {
     $discoveryErrors=@()
@@ -1779,7 +1882,10 @@ try {
         Write-Host ('[{0}/{1}] {2}' -f ($index+1),$files.Count,$file.FullName)
         Write-Progress -Activity 'Offline EVTX audit' -Status $file.Name -PercentComplete (100*$index/$files.Count)
         $selected=0; $parseErrors=0; $messageMissing=0; $before=$script:FindingCount
-        $status='OK'; $note='Отбор через Windows API выполнен; читаются только записи по правилам и Critical/Error.'; $selectionMethod='Правила + Critical/Error'; $hash=''
+        $status='OK'; $hash=''
+        if ($script:GenericErrors) { $note='Отбор через Windows API выполнен; читаются только записи по правилам и Critical/Error.'; $selectionMethod='Правила + Critical/Error' }
+        else { $note='Отбор через Windows API выполнен; читаются только записи по правилам (общий отбор Critical/Error выключен, см. -IncludeAllErrors).'; $selectionMethod='Правила' }
+        if ($script:HasStart -or $script:HasEnd) { $note+=' Задан период -StartTime/-EndTime: события вне периода не читались.' }
         $first=''; $last=''; $reader=$null; $state=@{}; $spoolWriters=@{}; $lastTimes=@{}
         $channels=New-Object 'System.Collections.Generic.HashSet[string]'
         $computers=New-Object 'System.Collections.Generic.HashSet[string]'
@@ -1819,7 +1925,7 @@ try {
                 $q=New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($file.FullName,[System.Diagnostics.Eventing.Reader.PathType]::FilePath,$queryText)
                 $q.ReverseDirection=$false; $q.TolerateQueryErrors=$false
                 $reader=New-Object System.Diagnostics.Eventing.Reader.EventLogReader($q)
-                $reader.BatchSize=256
+                $reader.BatchSize=1024
             } catch {
                 # Safety fallback: if the optimized structured query is rejected by this
                 # Windows/.NET build, read the EVTX sequentially and apply the same rules
@@ -1829,7 +1935,7 @@ try {
                     $q=New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($file.FullName,[System.Diagnostics.Eventing.Reader.PathType]::FilePath,'*')
                     $q.ReverseDirection=$false; $q.TolerateQueryErrors=$false
                     $reader=New-Object System.Diagnostics.Eventing.Reader.EventLogReader($q)
-                    $reader.BatchSize=256
+                    $reader.BatchSize=1024
                     $note='Фильтрованный запрос Windows API отклонен; выполнен полный последовательный просмотр EVTX с теми же правилами. Причина фильтра: '+$filteredError
                     $selectionMethod='Полный просмотр (fallback)'
                     Write-Warning ('Фильтрованный запрос не открылся; используется полный просмотр: '+$file.FullName)
@@ -1870,6 +1976,8 @@ try {
                             Reset-Rdp $state '' 'Пропущено событие из-за ошибки разбора: корреляция разорвана.'
                             continue
                         }
+                        # The XPath time window is not applied by the full-scan fallback.
+                        if (($script:HasStart -and $e.Ticks -lt $script:StartTicks) -or ($script:HasEnd -and $e.Ticks -gt $script:EndTicks)) { continue }
                         # Event timestamps can move slightly backwards because of NTP corrections or
                         # provider/write ordering. Treat only a material rollback (>= 5 minutes)
                         # as an audit warning and RDP-correlation boundary. Security 4616 remains
@@ -1886,9 +1994,10 @@ try {
                         if ($r) {
                             $e.Fingerprint=Hash-Text $e.Xml
                             $findingId=Save-Finding $e $r $file $evidenceName
-                            Save-Failure $e $file $findingId $spoolWriters
+                            if ($e.Id -in $script:FailureIds) { Save-Failure $e $file $findingId $spoolWriters }
                         }
-                        Handle-Rdp $e $state $file.FullName $findingId
+                        # Skip the call for events that cannot open, close or reset an RDP interval.
+                        if ($script:RdpRelevant.Contains($e.Provider+'|'+$e.Id)) { Handle-Rdp $e $state $file.FullName $findingId }
                     } finally { $record.Dispose() }
                     if ($selected % 10000 -eq 0) {
                         Write-Progress -Activity 'Offline EVTX audit' -Status ($file.Name+': selected '+$selected) -PercentComplete (100*$index/$files.Count)
