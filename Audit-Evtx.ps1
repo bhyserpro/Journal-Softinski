@@ -5242,7 +5242,8 @@ function Combine-CsvParts([object[]]$Parts,[string]$Destination) {
     try {
         $firstPart=$true
         foreach ($part in $Parts) {
-            $reader=New-Object System.IO.StreamReader($part.FullName,[Text.Encoding]::UTF8,$true,65536)
+            $stream=New-Object IO.FileStream($part.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+            $reader=New-Object System.IO.StreamReader($stream,[Text.Encoding]::UTF8,$true,65536)
             try {
                 $lineNumber=0
                 while (-not $reader.EndOfStream) {
@@ -5326,8 +5327,11 @@ $script:MediumHeaders=[Collections.Generic.HashSet[string]]::new([string[]]@('С
     'Описание типа','Идентификатор устройства','Действие','Примечание','Группа','Источник правила'))
 $script:HiddenFindingHeaders=[Collections.Generic.HashSet[string]]::new([string[]]@('Папка источника','Полный путь','Канал','Уровень Windows','Статус описания','SHA256 XML события','Восстановление XML','Правило'))
 function Read-CsvHeader([string]$Path) {
-    $reader=New-Object IO.StreamReader($Path,[Text.Encoding]::UTF8,$true)
-    try { $line=$reader.ReadLine() } finally { $reader.Dispose() }
+    # FileShare.ReadWrite: Errors.csv and other reports may still be open for writing
+    # (Windows refuses a plain read of such a file; SelfTest reads the plan this way).
+    $stream=New-Object IO.FileStream($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    $reader=New-Object IO.StreamReader($stream,[Text.Encoding]::UTF8,$true)
+    try { $line=$reader.ReadLine() } finally { $reader.Dispose(); $stream.Dispose() }
     if (-not $line) { return @() }
     $quote='"'
     return @($line.Trim().Trim($quote) -split [regex]::Escape($quote+[string]$Delimiter+$quote))
