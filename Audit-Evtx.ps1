@@ -53,7 +53,9 @@ rules/windows/builtin). Поддерживаемое подмножество о
 .NOTES
 См. README.md: семантика, ограничения и статус проверки.
 #>
-[CmdletBinding()]
+# Named parameters only: a value that slips in without a name (e.g. a lost line break
+# when pasting the launch commands) is an error instead of landing in -FailureThreshold.
+[CmdletBinding(PositionalBinding=$false)]
 param(
     [string]$InputPath,
     [string]$OutputPath = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Evtx-Audit'),

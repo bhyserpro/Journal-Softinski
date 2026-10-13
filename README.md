@@ -14,29 +14,26 @@
 Если SelfTest завершится ошибкой, основной анализ не начнётся.
 
 ```powershell
-cd "C:\Users\VATukkaev\Desktop\audit script"
-$ErrorActionPreference = 'Stop'
-$EvtxRunner = [scriptblock]::Create(
-    (Get-Content -LiteralPath '.\Audit-Evtx.ps1' -Raw -Encoding UTF8 -ErrorAction Stop)
-)
+cd "C:\Users\VATukkaev\Desktop\audit script";
+$ErrorActionPreference = 'Stop';
+$EvtxRunner = [scriptblock]::Create((Get-Content -LiteralPath '.\Audit-Evtx.ps1' -Raw -Encoding UTF8 -ErrorAction Stop));
 try {
-    & $EvtxRunner -SelfTest
-
-    $Logs = Read-Host 'Вставьте общую папку с логами'
-    $Out = Read-Host 'Вставьте папку для новых результатов'
-    $RunParams = @{
-        InputPath  = $Logs.Trim().Trim('"')
-        OutputPath = $Out.Trim().Trim('"')
-        # StartTime = '2026-09-01'                       # только период: самый сильный способ ускорить
-        # SigmaRulesPath = 'D:\sigma\rules\windows\builtin' # дополнительные правила Sigma
-    }
-    & $EvtxRunner @RunParams
+    & $EvtxRunner -SelfTest;
+    $Logs = Read-Host 'Вставьте общую папку с логами';
+    $Out = Read-Host 'Вставьте папку для новых результатов';
+    $RunParams = @{ InputPath = $Logs.Trim().Trim('"'); OutputPath = $Out.Trim().Trim('"') };
+    # $RunParams.StartTime = '2026-09-01';                          # только период: самый сильный способ ускорить
+    # $RunParams.SigmaRulesPath = 'D:\sigma\rules\windows\builtin';  # дополнительные правила Sigma
+    & $EvtxRunner @RunParams;
 } catch {
-    Write-Host 'Остановлено из-за ошибки:' -ForegroundColor Red
-    $_.Exception.Message
-    $_.ScriptStackTrace
+    Write-Host 'Остановлено из-за ошибки:' -ForegroundColor Red;
+    $_.Exception.Message;
+    $_.ScriptStackTrace;
 }
 ```
+
+Команды заканчиваются `;` и не содержат пустых строк: при вставке в консоль PowerShell
+переносы строк иногда теряются, и без `;` соседние строки склеиваются в одну команду.
 
 Успешный SelfTest заканчивается строкой `ALL SELFTESTS PASSED — version 10.0.0`.
 Удобнее всего класть выгрузку каждого компьютера в свою подпапку: связи событий
