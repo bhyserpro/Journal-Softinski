@@ -35,6 +35,10 @@ rules/windows/builtin). Поддерживаемое подмножество о
 .PARAMETER NoCompiledEngine
 Не компилировать C#-ядро (совместимый режим на PowerShell, медленнее, без Sigma).
 
+.PARAMETER AttackTriage
+Дополнительно построить листы эвристического поиска атак (Инциденты, Приоритетные,
+Подбор_пароля). По умолчанию отчет строится по правилам Sigma (лист «Нарушения»).
+
 .PARAMETER IncludeNoise
 Вернуть шумные события, исключенные по умолчанию.
 
@@ -87,12 +91,13 @@ param(
     [string[]]$SigmaRulesPath,
     [switch]$NoSigma,
     [switch]$NoCompiledEngine,
+    [switch]$AttackTriage,
     [string]$ExtraAvFilePattern = '(?i)(doctor[ ._-]*web|dr[ ._-]*web|kaspersky|eset|symantec|sophos|mcafee|trend.?micro)',
     [switch]$SelfTest
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$script:Version = '10.0.0'
+$script:Version = '11.0.0'
 $script:Utf8 = New-Object System.Text.UTF8Encoding($true)
 $script:Invariant = [Globalization.CultureInfo]::InvariantCulture
 # Time zone for the "(местное)" columns: -DisplayTimeZone (Windows id, e.g. 'Russian Standard Time') or this computer's zone.
@@ -1655,7 +1660,7 @@ namespace __NS__
 
     public sealed class Engine : IDisposable
     {
-        public const string Version = "10.0.0";
+        public const string Version = "11.0.0";
         // Configuration (set by PowerShell before Open()).
         public bool IncludeNoise, IncludeNetworkLogons, DeepScriptScan, IncludeProcessCreation, IncludeAllAntivirusEvents, GenericErrors, SkipCorrelation, KeepEvidence;
         public int MaxEventId = 10000, FailureThreshold = 10, WindowMinutes = 10, SprayUserThreshold = 5, RowsPerCsv = 500000;
@@ -1811,6 +1816,7 @@ namespace __NS__
             lastTimes[e.Computer] = e.Ticks;
             seq++;
             RuleDef r = Match(e);
+            if (Sigma != null) Sigma.Observe(e);
             List<SigmaRule> sigmaHits = Sigma != null ? Sigma.Evaluate(e) : null;
             if (r == null && sigmaHits != null) r = Sigma.FindingRule(sigmaHits);
             long id = 0;
@@ -2696,6 +2702,9 @@ namespace __NS__
         public readonly List<string> Tags = new List<string>();
         public readonly List<string> FalsePositives = new List<string>();
         public string Fstec = "";
+        // evtxa_group: report group; fields: "Label=Field" or "Field" shown in the violation details.
+        public string Group = "";
+        internal readonly List<KeyValuePair<string, string>> Fields = new List<KeyValuePair<string, string>>();
         internal readonly List<SVariant> Variants = new List<SVariant>();
         internal readonly List<KeyValuePair<SigmaCorrelation, int>> UsedBy = new List<KeyValuePair<SigmaCorrelation, int>>();
         public bool Standalone = true;
@@ -2719,6 +2728,7 @@ namespace __NS__
         public readonly List<string> Tags = new List<string>();
         public readonly List<string> FalsePositives = new List<string>();
         public string Fstec = "";
+        public string Group = "";
         internal readonly List<string> RuleRefs = new List<string>();
         internal readonly List<SigmaRule> Steps = new List<SigmaRule>();
         internal readonly List<string> GroupBy = new List<string>();
@@ -2736,7 +2746,7 @@ namespace __NS__
 
     sealed class SigmaAlert
     {
-        public string Title, Id, Level, Description, Source, Fstec, Folder, Computer, Group, Chain, Type;
+        public string Title, Id, Level, Description, Source, Fstec, Folder, Computer, Group, Chain, Type, ReportGroup;
         public List<string> Tags, FalsePositives;
         public long FirstTicks, LastTicks, Count;
         public readonly List<EventRef> Refs = new List<EventRef>();
@@ -2784,6 +2794,10 @@ namespace __NS__
             s["dns-server"] = new string[] { "DNS Server", null };
             s["kernel-pnp-configuration"] = new string[] { "Microsoft-Windows-Kernel-PnP/Configuration", "Microsoft-Windows-Kernel-PnP" };
             s["partition-diagnostic"] = new string[] { "Microsoft-Windows-Partition/Diagnostic", "Microsoft-Windows-Partition" };
+            s["applocker"] = new string[] { "Microsoft-Windows-AppLocker/EXE and DLL|Microsoft-Windows-AppLocker/MSI and Script", "Microsoft-Windows-AppLocker" };
+            s["wlan-autoconfig"] = new string[] { "Microsoft-Windows-WLAN-AutoConfig/Operational", "Microsoft-Windows-WLAN-AutoConfig" };
+            s["printservice-operational"] = new string[] { "Microsoft-Windows-PrintService/Operational", "Microsoft-Windows-PrintService" };
+            s["networkprofile"] = new string[] { "Microsoft-Windows-NetworkProfile/Operational", "Microsoft-Windows-NetworkProfile" };
             return s;
         }
         static readonly Dictionary<string, int[]> SysmonCategories = BuildCategories();
@@ -2891,6 +2905,13 @@ namespace __NS__
             rule.Tags.AddRange(StrList(doc.Get("tags")));
             rule.FalsePositives.AddRange(StrList(doc.Get("falsepositives")));
             rule.Fstec = U.Join(", ", StrList(doc.Get("fstec239")));
+            rule.Group = Str(doc.Get("evtxa_group")).Trim();
+            foreach (string f in StrList(doc.Get("fields")))
+            {
+                int eq = f.IndexOf('=');
+                if (eq > 0) rule.Fields.Add(new KeyValuePair<string, string>(f.Substring(0, eq).Trim(), f.Substring(eq + 1).Trim()));
+                else if (f.Trim().Length > 0) rule.Fields.Add(new KeyValuePair<string, string>(Label(f.Trim()), f.Trim()));
+            }
             YMap logsource = doc.Get("logsource") as YMap;
             if (logsource == null) throw new FormatException("нет logsource");
             string product = Str(logsource.Get("product")).ToLowerInvariant();
@@ -2959,10 +2980,16 @@ namespace __NS__
                 }
                 throw new NotSupportedException("logsource category " + category + " не поддерживается");
             }
-            if (service.Length == 0) throw new NotSupportedException("logsource без service/category");
+            if (service.Length == 0)
+            {
+                // product: windows only. The rule names its providers (Provider_Name) itself.
+                list.Add(new SVariant());
+                return list;
+            }
             string[] svc;
             if (!Services.TryGetValue(service, out svc)) throw new NotSupportedException("logsource service " + service + " не поддерживается");
-            SVariant s = new SVariant(); s.Channel = svc[0]; s.DefaultProvider = svc[1]; list.Add(s);
+            // Several channels are separated by '|' (AppLocker writes to more than one log).
+            foreach (string channel in svc[0].Split('|')) { SVariant s = new SVariant(); s.Channel = channel; s.DefaultProvider = svc[1]; list.Add(s); }
             return list;
         }
         static Dictionary<int, bool> Ids(params int[] values)
@@ -3170,6 +3197,7 @@ namespace __NS__
             cor.Tags.AddRange(StrList(doc.Get("tags")));
             cor.FalsePositives.AddRange(StrList(doc.Get("falsepositives")));
             cor.Fstec = U.Join(", ", StrList(doc.Get("fstec239")));
+            cor.Group = Str(doc.Get("evtxa_group")).Trim();
             cor.Type = Str(c.Get("type")).Trim().ToLowerInvariant();
             if (cor.Type != "event_count" && cor.Type != "value_count" && cor.Type != "temporal" && cor.Type != "temporal_ordered")
                 throw new NotSupportedException("тип корреляции " + cor.Type + " не поддерживается");
@@ -3476,6 +3504,7 @@ namespace __NS__
 
         public void Record(EvtEvent e, List<SigmaRule> matched, string folder, string fileName, string fullPath, long findingId, long seq)
         {
+            AddViolation(e, matched, fullPath, findingId, seq);
             EventRef er = null;
             foreach (SigmaRule r in matched)
             {
@@ -3488,6 +3517,7 @@ namespace __NS__
                     if (!standalone.TryGetValue(key, out a))
                     {
                         a = NewAlert(r.Title, r.Id, r.Level, r.Description, r.Source, r.Fstec, r.Tags, r.FalsePositives, "detection", folder, e.Computer);
+                        a.ReportGroup = r.Group;
                         a.FirstTicks = e.Ticks; a.LastTicks = e.Ticks;
                         standalone[key] = a;
                     }
@@ -3683,6 +3713,7 @@ namespace __NS__
         SigmaAlert CorrAlert(SigmaCorrelation c, IList<SigmaHit> hits, string groupText)
         {
             SigmaAlert a = NewAlert(c.Title, c.Id, c.Level, c.Description, c.Source, c.Fstec, c.Tags, c.FalsePositives, c.Type, hits[0].Ref.Folder, hits[0].Ref.Computer);
+            a.ReportGroup = c.Group;
             a.Group = groupText;
             a.FirstTicks = hits[0].Ticks; a.LastTicks = hits[0].Ticks;
             foreach (SigmaHit h in hits) AddToAlert(a, h.Ref);
@@ -3705,10 +3736,280 @@ namespace __NS__
         }
 
         // -------------------------------------------------------- output
+        // ------------------------------------------------ violations: one row per event (as Chainsaw hunt)
+        public TimeZoneInfo DisplayZone = TimeZoneInfo.Local;
+        public int MaxViolations = 300000;
+        public long ViolationRows;
+        sealed class ViolationRow { public string Computer; public long Ticks, LastTicks, Seq; public int Repeats = 1; public bool InferUser; public string[] Cells; }
+        sealed class Session { public long Start, End = long.MaxValue; public string Computer, LogonId, Account, Type; }
+        readonly Dictionary<string, List<Session>> sessions = new Dictionary<string, List<Session>>(StringComparer.Ordinal);
+        readonly Dictionary<string, List<long>> sessionEnds = new Dictionary<string, List<long>>(StringComparer.Ordinal);
+        readonly Dictionary<string, string> sidNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        // Logons and account names seen in Security: device events are written by SYSTEM and
+        // installer events carry only a SID, so the report adds the probable user afterwards.
+        public void Observe(EvtEvent e)
+        {
+            if (e.Id < 4624 || e.Id > 4800 || !U.EqI(e.Provider, "Microsoft-Windows-Security-Auditing")) return;
+            string subjectSid = e.Get("SubjectUserSid");
+            if (subjectSid.StartsWith("S-1-5-21-", StringComparison.OrdinalIgnoreCase) && e.Subject.Length > 0 && !sidNames.ContainsKey(subjectSid)) sidNames[subjectSid] = e.Subject;
+            string computer = e.Computer.ToLowerInvariant();
+            if (e.Id == 4624)
+            {
+                string targetSid = e.Get("TargetSid");
+                if (targetSid.StartsWith("S-1-5-21-", StringComparison.OrdinalIgnoreCase) && e.Target.Length > 0 && !sidNames.ContainsKey(targetSid)) sidNames[targetSid] = e.Target;
+                if (e.LogonType != "2" && e.LogonType != "10" && e.LogonType != "11") return;
+                if (e.Target.Length == 0 || e.Target.EndsWith("$") || targetSid.StartsWith("S-1-5-90-") || targetSid.StartsWith("S-1-5-96-") || targetSid == "S-1-5-18") return;
+                Session session = new Session(); session.Computer = computer; session.Start = e.Ticks; session.LogonId = e.LogonId.ToLowerInvariant(); session.Account = e.Target; session.Type = e.LogonType;
+                List<Session> list;
+                if (!sessions.TryGetValue(computer, out list)) { list = new List<Session>(); sessions[computer] = list; }
+                if (list.Count < 100000) list.Add(session);
+            }
+            else if ((e.Id == 4634 || e.Id == 4647) && e.LogonId.Length > 0)
+            {
+                string key = computer + "|" + e.LogonId.ToLowerInvariant();
+                List<long> ends;
+                if (!sessionEnds.TryGetValue(key, out ends)) { ends = new List<long>(); sessionEnds[key] = ends; }
+                if (ends.Count < 1000) ends.Add(e.Ticks);
+            }
+        }
+        string ProbableUser(string computer, long ticks)
+        {
+            List<Session> list;
+            if (!sessions.TryGetValue(computer.ToLowerInvariant(), out list)) return null;
+            Session found = null;
+            foreach (Session s in list)
+            {
+                if (s.Start > ticks || ticks - s.Start > 7 * TimeSpan.TicksPerDay || s.End < ticks) continue;
+                if (found == null || s.Start > found.Start) found = s;
+            }
+            if (found == null) return null;
+            return "вероятно " + found.Account + " (вход " + U.UtcText(found.Start) + " UTC, тип " + found.Type + (found.End == long.MaxValue ? ", выход не зафиксирован)" : ", выход " + U.UtcText(found.End) + " UTC)");
+        }
+        public sealed class ViolationStat
+        {
+            public string Computer { get; set; }
+            public string Group { get; set; }
+            public string Level { get; set; }
+            public string Title { get; set; }
+            public long Count { get; set; }
+        }
+        readonly List<ViolationRow> violations = new List<ViolationRow>();
+        readonly Dictionary<string, ViolationRow> lastViolation = new Dictionary<string, ViolationRow>(StringComparer.Ordinal);
+        readonly Dictionary<string, ViolationStat> violationStats = new Dictionary<string, ViolationStat>(StringComparer.Ordinal);
+        bool violationsTruncated;
+        public static readonly string[] ViolationHeaders = new string[] {
+            "Уровень", "Время (местное)", "Время UTC", "Компьютер", "Группа", "Нарушение", "Пользователь", "Детали", "Повторов",
+            "Event ID", "Журнал", "Файл", "Record ID", "Номер находки", "ID правил" };
+        static readonly Dictionary<int, bool> TargetIsActor = Ids(4624, 4625, 4634, 4647, 4648, 4771, 4776, 4740, 4778, 4779, 4964);
+        static readonly Dictionary<string, bool> NoiseFields = NewNames("SubjectUserSid", "SubjectLogonId", "TargetLogonId", "ProcessId", "LogonGuid", "KeyLength",
+            "TransmittedServices", "LmPackageName", "ImpersonationLevel", "RestrictedAdminMode", "TargetOutboundUserName", "TargetOutboundDomainName",
+            "VirtualAccount", "TargetLinkedLogonId", "ElevatedToken", "TargetUserSid", "Binary");
+        static readonly Dictionary<string, string> Labels = BuildLabels();
+        static Dictionary<string, bool> NewNames(params string[] names)
+        {
+            Dictionary<string, bool> d = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            foreach (string n in names) d[n] = true;
+            return d;
+        }
+        static Dictionary<string, string> BuildLabels()
+        {
+            Dictionary<string, string> d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            d["TargetUserName"] = "УЗ"; d["TargetDomainName"] = "Домен"; d["SubjectUserName"] = "Кто"; d["SubjectDomainName"] = "Домен инициатора";
+            d["IpAddress"] = "IP"; d["WorkstationName"] = "Станция"; d["Workstation"] = "Станция"; d["LogonType"] = "Тип входа"; d["ProcessName"] = "Процесс";
+            d["ServiceName"] = "Служба"; d["ImagePath"] = "Путь"; d["ServiceFileName"] = "Путь"; d["StartType"] = "Запуск"; d["AccountName"] = "УЗ службы";
+            d["PreviousTime"] = "Было"; d["NewTime"] = "Стало"; d["TargetSid"] = "SID"; d["MemberName"] = "Участник"; d["MemberSid"] = "SID участника";
+            d["PrivilegeList"] = "Права"; d["TaskName"] = "Задание"; d["Status"] = "Статус"; d["SubStatus"] = "Подстатус"; d["DeviceDescription"] = "Устройство";
+            d["DeviceId"] = "ID устройства"; d["DeviceInstanceId"] = "ID устройства"; d["ClassName"] = "Класс"; d["Manufacturer"] = "Производитель";
+            d["Model"] = "Модель"; d["SerialNumber"] = "Серийный №"; d["Threat Name"] = "Угроза"; d["Path"] = "Путь"; d["Image"] = "Программа";
+            d["CommandLine"] = "Команда"; d["ParentImage"] = "Родитель"; d["User"] = "Пользователь"; d["FilePath"] = "Файл"; d["SSID"] = "Сеть";
+            return d;
+        }
+        static string Label(string field) { string l; return Labels.TryGetValue(field, out l) ? l : field; }
+        public static string LevelText(string level)
+        {
+            switch ((level ?? "").ToLowerInvariant())
+            {
+                case "critical": return "Критический";
+                case "high": return "Высокий";
+                case "medium": return "Средний";
+                case "low": return "Низкий";
+                case "informational": return "Инфо";
+                default: return level ?? "";
+            }
+        }
+        public static string GroupOf(string group, List<string> tags)
+        {
+            if (!string.IsNullOrEmpty(group)) return group;
+            if (tags != null)
+            {
+                foreach (string t in tags)
+                {
+                    switch (t.ToLowerInvariant())
+                    {
+                        case "attack.credential-access": case "attack.credential_access": return "Входы в систему";
+                        case "attack.persistence": return "Установка ПО и служб";
+                        case "attack.defense-evasion": case "attack.defense_evasion": return "Средства защиты";
+                        case "attack.lateral-movement": case "attack.lateral_movement": return "Удаленный доступ";
+                        case "attack.execution": return "Запуск программ";
+                        case "attack.privilege-escalation": case "attack.privilege_escalation": return "Права и группы";
+                    }
+                }
+            }
+            return "Прочее";
+        }
+        static string WellKnown(string sid)
+        {
+            switch (sid ?? "")
+            {
+                case "S-1-5-18": return "NT AUTHORITY\\SYSTEM";
+                case "S-1-5-19": return "NT AUTHORITY\\LOCAL SERVICE";
+                case "S-1-5-20": return "NT AUTHORITY\\NETWORK SERVICE";
+                default: return sid ?? "";
+            }
+        }
+        // Who acted: the logged-on account for logon events, otherwise the subject (not a
+        // computer or service account), otherwise user fields of other logs.
+        static string ViolationUser(EvtEvent e)
+        {
+            if (TargetIsActor.ContainsKey(e.Id) && e.Id != 4648 && e.Target.Length > 0) return e.Target;
+            string sid = e.Get("SubjectUserSid");
+            bool machine = e.Get("SubjectUserName").EndsWith("$") || sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20";
+            if (e.Subject.Length > 0 && !machine) return e.Subject;
+            foreach (string f in new string[] { "User", "param7", "Detection User", "UserName", "Param3" })
+            {
+                string v = e.GetData(f);
+                if (!string.IsNullOrEmpty(v) && v.Trim().Length > 0 && v != "-") return v.Trim();
+            }
+            if (e.Subject.Length > 0) return e.Subject;
+            return WellKnown(e.SecurityUserId);
+        }
+        static string Details(EvtEvent e, List<SigmaRule> rules)
+        {
+            StringBuilder sb = new StringBuilder();
+            Dictionary<string, bool> seen = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            SCtx ctx = new SCtx(); ctx.E = e;
+            bool any = false;
+            foreach (SigmaRule r in rules)
+            {
+                ctx.FieldMap = null;
+                foreach (SVariant v in r.Variants) if (v.Channel == null || U.EqI(v.Channel, e.Channel)) { ctx.FieldMap = v.FieldMap; break; }
+                foreach (KeyValuePair<string, string> f in r.Fields)
+                {
+                    any = true;
+                    if (seen.ContainsKey(f.Value)) continue;
+                    seen[f.Value] = true;
+                    AppendDetail(sb, f.Key, ctx.Field(f.Value));
+                }
+            }
+            if (!any)
+            {
+                int n = 0;
+                for (int i = 0; i < e.Keys.Count && n < 8; i++)
+                {
+                    if (NoiseFields.ContainsKey(e.Keys[i])) continue;
+                    if (AppendDetail(sb, Label(e.Keys[i]), e.Values[i])) n++;
+                }
+            }
+            string text = sb.ToString();
+            return text.Length > 1000 ? text.Substring(0, 1000) + "…" : text;
+        }
+        static bool AppendDetail(StringBuilder sb, string label, string value)
+        {
+            if (value == null) return false;
+            string v = value.Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim();
+            if (v.Length == 0 || v == "-") return false;
+            if (v.Length > 300) v = v.Substring(0, 300) + "…";
+            if (sb.Length > 0) sb.Append("; ");
+            sb.Append(label).Append(": ").Append(v);
+            return true;
+        }
+        void AddViolation(EvtEvent e, List<SigmaRule> matched, string fullPath, long findingId, long seq)
+        {
+            List<SigmaRule> rules = null;
+            foreach (SigmaRule r in matched)
+            {
+                if (!r.Standalone || Score(r.Level) <= 20) continue;
+                if (rules == null) rules = new List<SigmaRule>();
+                rules.Add(r);
+            }
+            if (rules == null) return;
+            rules.Sort(delegate(SigmaRule a, SigmaRule b) { int c = Score(b.Level).CompareTo(Score(a.Level)); return c != 0 ? c : a.Index.CompareTo(b.Index); });
+            SigmaRule top = rules[0];
+            List<string> titles = new List<string>(), ruleIds = new List<string>();
+            foreach (SigmaRule r in rules) { titles.Add(r.Title); ruleIds.Add(r.Id); }
+            string titleText = string.Join(" | ", titles.ToArray());
+            string user = ViolationUser(e);
+            string details = Details(e, rules);
+            // The same violation repeated within a minute (bursts, several log sources) is one row.
+            string key = e.Computer.ToLowerInvariant() + "\u001f" + titleText + "\u001f" + user + "\u001f" + details;
+            ViolationRow last;
+            if (lastViolation.TryGetValue(key, out last) && e.Ticks >= last.LastTicks && e.Ticks - last.LastTicks <= 60 * TimeSpan.TicksPerSecond)
+            {
+                last.Repeats++; last.LastTicks = e.Ticks;
+                return;
+            }
+            string group = GroupOf(top.Group, top.Tags);
+            string statKey = e.Computer.ToLowerInvariant() + "\u001f" + group + "\u001f" + top.Level + "\u001f" + top.Title;
+            ViolationStat st;
+            if (!violationStats.TryGetValue(statKey, out st))
+            {
+                st = new ViolationStat(); st.Computer = e.Computer; st.Group = group; st.Level = LevelText(top.Level); st.Title = top.Title;
+                violationStats[statKey] = st;
+            }
+            st.Count++;
+            ViolationRows++;
+            if (violations.Count >= MaxViolations)
+            {
+                if (!violationsTruncated) { violationsTruncated = true; Problem("Нарушения", "", "достигнут предел " + MaxViolations + " строк; остальные нарушения учтены только в счетчиках листов Сводка и Правила", false); }
+                return;
+            }
+            string local = "";
+            try { local = TimeZoneInfo.ConvertTimeFromUtc(new DateTime(e.Ticks, DateTimeKind.Utc), DisplayZone).ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture); }
+            catch (Exception) { }
+            ViolationRow row = new ViolationRow();
+            row.Computer = e.Computer; row.Ticks = e.Ticks; row.LastTicks = e.Ticks; row.Seq = seq;
+            row.InferUser = (group == "Съемные носители" || group == "Сеть и периферия") &&
+                (user.Length == 0 || user.EndsWith("$") || user.StartsWith("NT AUTHORITY", StringComparison.OrdinalIgnoreCase));
+            row.Cells = new string[] { LevelText(top.Level), local, U.UtcText(e.Ticks), e.Computer, group, titleText, user, details, "",
+                e.Id.ToString(CultureInfo.InvariantCulture), e.Channel, fullPath, e.RecordId, findingId > 0 ? findingId.ToString(CultureInfo.InvariantCulture) : "",
+                string.Join(", ", ruleIds.ToArray()) };
+            violations.Add(row);
+            lastViolation[key] = row;
+        }
+        // Sorted by computer and time; returns the number of rows written.
+        public int WriteViolations(TextWriter w, string delimiter)
+        {
+            violations.Sort(delegate(ViolationRow a, ViolationRow b)
+            {
+                int c = string.Compare(a.Computer, b.Computer, StringComparison.OrdinalIgnoreCase);
+                if (c != 0) return c;
+                c = a.Ticks.CompareTo(b.Ticks);
+                return c != 0 ? c : a.Seq.CompareTo(b.Seq);
+            });
+            foreach (List<Session> list in sessions.Values)
+                foreach (Session s in list)
+                {
+                    List<long> ends;
+                    if (s.LogonId.Length == 0 || !sessionEnds.TryGetValue(s.Computer + "|" + s.LogonId, out ends)) continue;
+                    foreach (long t in ends) if (t >= s.Start && t < s.End) s.End = t;
+                }
+            Csv.Row(w, delimiter, ViolationHeaders);
+            foreach (ViolationRow r in violations)
+            {
+                r.Cells[8] = r.Repeats.ToString(CultureInfo.InvariantCulture);
+                string user = r.Cells[6], name;
+                if (user.StartsWith("S-1-5-21-", StringComparison.OrdinalIgnoreCase) && sidNames.TryGetValue(user, out name)) r.Cells[6] = name + " (" + user + ")";
+                if (r.InferUser) { string probable = ProbableUser(r.Computer, r.Ticks); if (probable != null) r.Cells[6] = probable; }
+                Csv.Row(w, delimiter, r.Cells);
+            }
+            return violations.Count;
+        }
+        public ViolationStat[] GetViolationStats() { return new List<ViolationStat>(violationStats.Values).ToArray(); }
+
         public static readonly string[] AlertHeaders = new string[] {
             "Приоритет", "Оценка риска", "Уровень Sigma", "Тип", "Правило", "ID правила", "Компьютер", "Папка источника",
             "Первое время UTC", "Последнее время UTC", "Событий", "Группировка", "Учетные записи", "IP источника", "Event ID",
-            "Цепочка событий", "Ссылки на события", "Тактика", "MITRE ATT&CK", "Меры ФСТЭК №239 (группы)", "Описание", "Ложные срабатывания", "Источник правила" };
+            "Цепочка событий", "Ссылки на события", "Тактика", "MITRE ATT&CK", "Меры ФСТЭК №239 (группы)", "Описание", "Ложные срабатывания", "Источник правила", "Группа" };
 
         public int Finish(TextWriter w, string delimiter)
         {
@@ -3760,7 +4061,7 @@ namespace __NS__
                     U.UtcText(a.FirstTicks), U.UtcText(a.LastTicks), a.Count.ToString(CultureInfo.InvariantCulture), a.Group,
                     U.Join(" | ", a.Accounts), U.Join(" | ", a.Ips), string.Join(", ", idText.ToArray()), a.Chain, U.Join(" || ", refs),
                     U.Join(" → ", tactics), U.Join(", ", techniques), fstecText, a.Description.Replace("\n", " "),
-                    U.Join("; ", a.FalsePositives), a.Source });
+                    U.Join("; ", a.FalsePositives), a.Source, GroupOf(a.ReportGroup, a.Tags) });
             }
             return all.Count;
         }
@@ -3853,21 +4154,57 @@ namespace __NS__
 '@
 # Embedded Sigma rule pack (Sigma v2 rules and correlation rules).
 $script:SigmaPack=@'
-# Встроенный пакет правил Sigma (формат Sigma v2, корреляции по спецификации
-# Sigma Correlation Rules). Базовые правила с полем name используются только в
-# корреляциях и сами не дают срабатываний; одиночные правила (без ссылок из
-# корреляций) дают срабатывания. Поле fstec239 — нестандартное расширение:
-# группы мер приказа ФСТЭК России №239.
-title: Создана учетная запись
-id: 36ac2807-90cc-43c1-af6b-28e935335552
-name: evtxa_account_created
-status: test
-description: Создание локальной или доменной учетной записи (4720). Базовое правило для корреляций.
+# EVTX Audit — пакет правил Sigma для аудита объектов КИИ / АСУ ТП.
+# Упор: действия персонала, запрещенные регламентом (время, учетные записи, носители,
+# установка ПО, средства защиты, журналы, перезагрузки, сети), и редкие признаки атак.
+# Свои поля пакета: evtxa_group — группа на листах отчета; fields — «Подпись=Поле»
+# для столбца «Детали»; fstec239 — группы мер приказа ФСТЭК № 239.
+title: Системное время изменено пользователем
+id: 8a3a3837-9a4e-5623-a946-3a28b685f2e1
+status: stable
+description: Время изменено не службой синхронизации, а учетной записью пользователя (панель управления, date/time, Set-Date, сторонняя программа). В АСУ ТП смена времени персоналом запрещена — искажается хронология технологических и защитных журналов.
 author: EVTX Audit
-date: 2026-10-08
+date: 2026-10-14
 tags:
-    - attack.persistence
-    - attack.t1136
+    - attack.defense-evasion
+    - attack.t1070.006
+evtxa_group: Изменение времени
+fstec239: [АУД]
+fields:
+    - Кто=SubjectUserName
+    - Домен=SubjectDomainName
+    - Было=PreviousTime
+    - Стало=NewTime
+    - Процесс=ProcessName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4616
+    filter_system:
+        SubjectUserSid:
+            - 'S-1-5-18'
+            - 'S-1-5-19'
+            - 'S-1-5-20'
+    condition: selection and not filter_system
+falsepositives:
+    - Согласованная корректировка часов администратором (должна быть в журнале работ)
+level: high
+---
+title: Создана учетная запись
+id: 8b84d11d-9f3c-5efb-bfd0-209e3590b937
+status: stable
+description: Создана новая учетная запись. Учетные записи на объекте АСУ ТП создаются только по заявке.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Учетные записи
+fstec239: [УПД, ИАФ]
+fields:
+    - УЗ=TargetUserName
+    - Домен=TargetDomainName
+    - SID=TargetSid
+    - Кто=SubjectUserName
 logsource:
     product: windows
     service: security
@@ -3875,15 +4212,23 @@ detection:
     selection:
         EventID: 4720
     condition: selection
-level: informational
+falsepositives:
+    - Создание УЗ по заявке
+level: high
 ---
 title: Удалена учетная запись
-id: 1efc515a-5834-4af5-8dbd-e4026fa77e37
-name: evtxa_account_deleted
-status: test
-description: Удаление учетной записи (4726). Базовое правило для корреляций.
+id: 525150dd-5e4c-5912-85b4-be683e31ca06
+status: stable
+description: Учетная запись удалена.
 author: EVTX Audit
-date: 2026-10-08
+date: 2026-10-14
+evtxa_group: Учетные записи
+fstec239: [УПД, ИАФ]
+fields:
+    - УЗ=TargetUserName
+    - Домен=TargetDomainName
+    - SID=TargetSid
+    - Кто=SubjectUserName
 logsource:
     product: windows
     service: security
@@ -3891,15 +4236,22 @@ detection:
     selection:
         EventID: 4726
     condition: selection
-level: informational
+falsepositives:
+    - Удаление УЗ уволенного работника по заявке
+level: high
 ---
 title: Включена учетная запись
-id: 1e571f09-0e34-4e3b-aff4-f4f6ad282ac7
-name: evtxa_account_enabled
-status: test
-description: Учетная запись включена (4722). Базовое правило для корреляций.
+id: 004acb7e-0fa2-59e4-8ecc-c46c3f956fd2
+status: stable
+description: Ранее отключенная учетная запись включена.
 author: EVTX Audit
-date: 2026-10-08
+date: 2026-10-14
+evtxa_group: Учетные записи
+fstec239: [УПД]
+fields:
+    - УЗ=TargetUserName
+    - SID=TargetSid
+    - Кто=SubjectUserName
 logsource:
     product: windows
     service: security
@@ -3907,15 +4259,22 @@ detection:
     selection:
         EventID: 4722
     condition: selection
-level: informational
+falsepositives:
+    - Включение УЗ по заявке
+level: medium
 ---
 title: Отключена учетная запись
-id: 20c191f3-e95d-4c27-97d2-e71ebb29a82d
-name: evtxa_account_disabled
-status: test
-description: Учетная запись отключена (4725). Базовое правило для корреляций.
+id: b80a24fd-0275-5818-a119-bced9fbdc0f9
+status: stable
+description: Учетная запись отключена.
 author: EVTX Audit
-date: 2026-10-08
+date: 2026-10-14
+evtxa_group: Учетные записи
+fstec239: [УПД]
+fields:
+    - УЗ=TargetUserName
+    - SID=TargetSid
+    - Кто=SubjectUserName
 logsource:
     product: windows
     service: security
@@ -3923,37 +4282,376 @@ detection:
     selection:
         EventID: 4725
     condition: selection
-level: informational
+falsepositives:
+    - Отключение УЗ по заявке
+level: medium
 ---
-title: Неудачный вход с сетевого адреса
-id: 6cccfbc5-7afb-4983-8fcb-1bf3885b7ae0
-name: evtxa_failed_logon
-status: test
-description: Неудачный вход (4625) с известным удаленным адресом. Базовое правило для корреляций.
+title: Сброшен пароль учетной записи
+id: 9191b0ed-95f3-569a-a5ab-6d981e6a6eb2
+status: stable
+description: Пароль учетной записи сброшен другим пользователем (администратором). Смена собственного пароля — событие 4723, сюда не входит.
 author: EVTX Audit
-date: 2026-10-08
+date: 2026-10-14
+evtxa_group: Учетные записи
+fstec239: [ИАФ]
+fields:
+    - УЗ=TargetUserName
+    - SID=TargetSid
+    - Кто=SubjectUserName
 logsource:
     product: windows
     service: security
 detection:
     selection:
-        EventID: 4625
-    filter_local:
-        IpAddress:
-            - '-'
-            - '127.0.0.1'
-            - '::1'
-            - ''
-    condition: selection and not filter_local
-level: informational
+        EventID: 4724
+    condition: selection
+falsepositives:
+    - Сброс забытого пароля по заявке
+level: medium
 ---
-title: Успешный RDP-вход
-id: f63ff011-a14e-4ba8-a03e-4b34c3d31314
-name: evtxa_rdp_logon
-status: test
-description: Успешный вход типа 10 (RemoteInteractive). Базовое правило для корреляций.
+title: Переименована учетная запись
+id: 11732bf1-a82a-5007-97e1-1d051391ab08
+status: stable
+description: Учетная запись переименована — это затрудняет учет и расследование.
 author: EVTX Audit
-date: 2026-10-08
+date: 2026-10-14
+evtxa_group: Учетные записи
+fstec239: [УПД, ИАФ]
+fields:
+    - Было=OldTargetUserName
+    - Стало=NewTargetUserName
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4781
+    condition: selection
+falsepositives:
+    - Переименование встроенных УЗ по требованиям безопасности
+level: high
+---
+title: Изменены параметры учетной записи
+id: 54c06c53-8a27-5626-acc2-f5dc86fc45e1
+status: stable
+description: Изменены атрибуты учетной записи (флаги UserAccountControl, срок действия, путь профиля и т.п.). Событие также сопровождает смену и сброс пароля.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Учетные записи
+fstec239: [УПД]
+fields:
+    - УЗ=TargetUserName
+    - Кто=SubjectUserName
+    - Флаги было=OldUacValue
+    - Флаги стало=NewUacValue
+    - Срок действия=AccountExpires
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4738
+    condition: selection
+falsepositives:
+    - Смена пароля, плановое администрирование
+level: low
+---
+title: Учетная запись заблокирована
+id: 3ff0dda3-c796-5d3f-a3dd-ffec92e31365
+status: stable
+description: Учетная запись заблокирована после неверных паролей. Источник — компьютер, с которого вводился пароль.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Входы в систему
+fstec239: [ИАФ]
+fields:
+    - УЗ=TargetUserName
+    - Компьютер-источник=TargetDomainName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4740
+    condition: selection
+falsepositives:
+    - Работник забыл пароль; сохраненный старый пароль в программе или службе
+level: medium
+---
+title: Учетная запись разблокирована
+id: af137809-1a8b-5c2c-b90b-92aaf517c36f
+status: stable
+description: Блокировка учетной записи снята вручную.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Учетные записи
+fstec239: [ИАФ]
+fields:
+    - УЗ=TargetUserName
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4767
+    condition: selection
+level: low
+---
+title: Создана скрытая учетная запись (имя оканчивается на $)
+id: 00749e0c-196b-5acb-90cd-7c7399c18aa7
+status: stable
+description: Имя новой учетной записи оканчивается символом $, как у учетных записей компьютеров; такие записи не видны в части оснасток.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.persistence
+    - attack.t1136.001
+evtxa_group: Учетные записи
+fstec239: [УПД]
+fields:
+    - УЗ=TargetUserName
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4720
+        TargetUserName|endswith: '$'
+    condition: selection
+level: high
+---
+title: Включена учетная запись Гость
+id: 2f0e8a24-3a7d-5bd0-91d9-829a3cafa1ab
+status: stable
+description: Включена встроенная учетная запись Гость (RID 501) — вход без персональной ответственности.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Учетные записи
+fstec239: [ИАФ, УПД]
+fields:
+    - УЗ=TargetUserName
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4722
+        TargetSid|endswith: '-501'
+    condition: selection
+level: high
+---
+title: Создана или удалена учетная запись компьютера
+id: 72d04290-2ff1-5ca6-b7de-bf489ce64527
+status: stable
+description: В домене создана или удалена учетная запись компьютера (событие контроллера домена).
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Учетные записи
+fstec239: [УПД]
+fields:
+    - Компьютер=TargetUserName
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID:
+            - 4741
+            - 4743
+    condition: selection
+level: medium
+---
+title: Добавление в группу администраторов
+id: f33f5a02-e712-5f2e-957a-438f0573a3a3
+status: stable
+description: Учетная запись добавлена в административную группу (Администраторы, Операторы архива, сервера, учета, печати, администраторы домена/предприятия/схемы).
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.persistence
+    - attack.t1098
+evtxa_group: Права и группы
+fstec239: [УПД]
+fields:
+    - Группа=TargetUserName
+    - Участник=MemberName
+    - SID участника=MemberSid
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID:
+            - 4728
+            - 4732
+            - 4756
+    selection_group:
+        - TargetSid:
+              - 'S-1-5-32-544'
+              - 'S-1-5-32-548'
+              - 'S-1-5-32-549'
+              - 'S-1-5-32-550'
+              - 'S-1-5-32-551'
+        - TargetSid|endswith:
+              - '-512'
+              - '-518'
+              - '-519'
+    condition: selection and selection_group
+falsepositives:
+    - Выдача прав администратора по заявке
+level: high
+---
+title: Добавление в группу удаленного доступа (RDP, WinRM)
+id: da404abc-3cc7-559f-bd84-f0fe8b9bc993
+status: stable
+description: Учетная запись добавлена в Remote Desktop Users или Remote Management Users — открыт удаленный вход.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Права и группы
+fstec239: [УПД]
+fields:
+    - Группа=TargetUserName
+    - Участник=MemberName
+    - SID участника=MemberSid
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID:
+            - 4728
+            - 4732
+            - 4756
+        TargetSid:
+            - 'S-1-5-32-555'
+            - 'S-1-5-32-580'
+    condition: selection
+level: high
+---
+title: Изменено членство в группе
+id: 95bf2aa1-a011-59d5-9a34-8463caa5e4eb
+status: stable
+description: Учетная запись добавлена в группу или удалена из группы (кроме административных и удаленного доступа — у них отдельные правила).
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Права и группы
+fstec239: [УПД]
+fields:
+    - Группа=TargetUserName
+    - Участник=MemberName
+    - SID участника=MemberSid
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID:
+            - 4728
+            - 4732
+            - 4756
+            - 4729
+            - 4733
+            - 4757
+    filter_privileged_add:
+        EventID:
+            - 4728
+            - 4732
+            - 4756
+        TargetSid:
+            - 'S-1-5-32-544'
+            - 'S-1-5-32-548'
+            - 'S-1-5-32-549'
+            - 'S-1-5-32-550'
+            - 'S-1-5-32-551'
+            - 'S-1-5-32-555'
+            - 'S-1-5-32-580'
+    filter_domain_admins:
+        EventID:
+            - 4728
+            - 4732
+            - 4756
+        TargetSid|endswith:
+            - '-512'
+            - '-518'
+            - '-519'
+    condition: selection and not filter_privileged_add and not filter_domain_admins
+level: medium
+---
+title: Назначено право пользователя
+id: 99d029b8-6154-547e-8fc6-ce2ef3b6a9ce
+status: stable
+description: Учетной записи назначено право (привилегия) или право входа (локально, по сети, по RDP, как служба).
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Права и группы
+fstec239: [УПД]
+fields:
+    - SID=TargetSid
+    - Права=PrivilegeList
+    - Право входа=AccessGranted
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID:
+            - 4704
+            - 4717
+    condition: selection
+falsepositives:
+    - Применение групповой политики, установка ПО
+level: medium
+---
+title: Вход под встроенной учетной записью Администратор
+id: a7a7a9be-f7ee-56b5-9341-20551da19306
+status: stable
+description: Интерактивный или удаленный вход под встроенным Администратором (RID 500) — действия не персонифицированы.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Входы в систему
+fstec239: [ИАФ, УПД]
+fields:
+    - УЗ=TargetUserName
+    - Тип входа=LogonType
+    - IP=IpAddress
+    - Станция=WorkstationName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4624
+        LogonType:
+            - 2
+            - 10
+            - 11
+        TargetUserSid|endswith: '-500'
+    condition: selection
+falsepositives:
+    - Согласованное аварийное администрирование
+level: medium
+---
+title: RDP-вход
+id: 55d2a0f0-eeeb-51db-b0c8-241dab9c96df
+status: stable
+description: Успешный удаленный вход по RDP (тип 10). Проверить, разрешен ли удаленный доступ к этому компьютеру и этой учетной записи.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Удаленный доступ
+fstec239: [УПД]
+fields:
+    - УЗ=TargetUserName
+    - IP=IpAddress
+    - Станция=WorkstationName
 logsource:
     product: windows
     service: security
@@ -3962,15 +4660,59 @@ detection:
         EventID: 4624
         LogonType: 10
     condition: selection
-level: informational
+falsepositives:
+    - Разрешенное удаленное администрирование
+level: medium
 ---
-title: Вход с явными учетными данными на другой узел
-id: 3b185395-9653-4ff5-87fb-551c9619423f
-name: evtxa_explicit_credentials
-status: test
-description: Вход с явными учетными данными (4648) не от служебных учетных записей и не на локальный узел. Базовое правило для корреляций.
+title: RDP-вход с внешнего адреса
+id: c30c7ddf-7330-5691-9626-8983fdf4f4f8
+status: stable
+description: Успешный RDP-вход с адреса вне частных диапазонов — RDP доступен извне или используется неучтенный канал.
 author: EVTX Audit
-date: 2026-10-08
+date: 2026-10-14
+tags:
+    - attack.initial-access
+    - attack.t1133
+evtxa_group: Удаленный доступ
+fstec239: [УПД, ЗИС]
+fields:
+    - УЗ=TargetUserName
+    - IP=IpAddress
+    - Станция=WorkstationName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4624
+        LogonType: 10
+        IpAddress|re: '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+    filter_private:
+        IpAddress|cidr:
+            - '10.0.0.0/8'
+            - '172.16.0.0/12'
+            - '192.168.0.0/16'
+            - '127.0.0.0/8'
+            - '169.254.0.0/16'
+            - '100.64.0.0/10'
+    condition: selection and not filter_private
+falsepositives:
+    - Публичная адресация внутренней сети
+level: high
+---
+title: Вход с явными учетными данными (runas)
+id: 832e8af5-a050-5486-a71c-3bb2c8935c61
+status: stable
+description: Пользователь запустил программу или подключение от имени другой учетной записи.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Входы в систему
+fstec239: [ИАФ, УПД]
+fields:
+    - Кто=SubjectUserName
+    - От имени=TargetUserName
+    - Сервер=TargetServerName
+    - Процесс=ProcessName
 logsource:
     product: windows
     service: security
@@ -3982,21 +4724,1477 @@ detection:
             - 'S-1-5-18'
             - 'S-1-5-19'
             - 'S-1-5-20'
-    filter_local:
-        TargetServerName:
-            - 'localhost'
-            - '-'
-            - '127.0.0.1'
-    condition: selection and not filter_system and not filter_local
+    filter_machine:
+        SubjectUserName|endswith: '$'
+    condition: selection and not filter_system and not filter_machine
+falsepositives:
+    - Подключение сетевых дисков с другими учетными данными, задания с сохраненным паролем
+level: low
+---
+title: Вход вне разрешенного времени или с неразрешенного компьютера
+id: 79a10fa8-b7d6-5333-9bc8-35a95d436f11
+status: stable
+description: Отказ во входе из-за ограничений учетной записи (часы входа, список рабочих станций) или под отключенной, просроченной учетной записью.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Входы в систему
+fstec239: [ИАФ, УПД]
+fields:
+    - УЗ=TargetUserName
+    - Подстатус=SubStatus
+    - Станция=WorkstationName
+    - IP=IpAddress
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4625
+        SubStatus:
+            - '0xc000006f'
+            - '0xc0000070'
+            - '0xc0000072'
+            - '0xc0000193'
+            - '0xc000015b'
+    condition: selection
+level: medium
+---
+title: Вход с паролем в открытом виде (тип 8)
+id: 68315eb0-d162-549c-8297-a8d1bc839968
+status: stable
+description: Пароль передан серверу в открытом виде (NetworkCleartext).
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Входы в систему
+fstec239: [ИАФ, ЗИС]
+fields:
+    - УЗ=TargetUserName
+    - IP=IpAddress
+    - Процесс=ProcessName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4624
+        LogonType: 8
+    condition: selection
+level: low
+---
+title: Подключен съемный накопитель (USB, SD)
+id: 053f7a36-0d06-5d60-af3f-1da60981e2b1
+status: stable
+description: К компьютеру подключен USB-накопитель, карта памяти или внешний диск. Сверить серийный номер с журналом учета машинных носителей.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.initial-access
+    - attack.t1091
+evtxa_group: Съемные носители
+fstec239: [ЗНИ]
+fields:
+    - Устройство=DeviceDescription
+    - Производитель=Manufacturer
+    - Модель=Model
+    - Серийный №=SerialNumber
+    - ID устройства=DeviceInstanceId
+    - ID=DeviceId
+    - Ёмкость, байт=Capacity
+logsource:
+    product: windows
+detection:
+    selection:
+        - Provider_Name: 'Microsoft-Windows-Kernel-PnP'
+          EventID:
+              - 400
+              - 410
+          DeviceInstanceId|startswith: 'USBSTOR\'
+        - Provider_Name: 'Microsoft-Windows-Partition'
+          EventID: 1006
+          BusType:
+              - 7
+              - 12
+              - 13
+        - Provider_Name: 'Microsoft-Windows-Security-Auditing'
+          EventID: 6416
+          DeviceId|startswith: 'USBSTOR\'
+    filter_removed:
+        Provider_Name: 'Microsoft-Windows-Partition'
+        Capacity: '0'
+    condition: selection and not filter_removed
+falsepositives:
+    - Учтенный носитель, разрешенный для этого компьютера
+level: high
+---
+title: Подключено портативное устройство (телефон, планшет, камера)
+id: 0a3f2a1e-d30e-5e65-b55d-2f816072aa25
+status: stable
+description: Подключено устройство MTP/WPD — как правило, смартфон (в том числе «для зарядки»). Подключение личных устройств к АРМ АСУ ТП запрещено.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Съемные носители
+fstec239: [ЗНИ]
+fields:
+    - Устройство=DeviceDescription
+    - ID устройства=DeviceInstanceId
+    - ID=DeviceId
+logsource:
+    product: windows
+detection:
+    selection:
+        - Provider_Name: 'Microsoft-Windows-Kernel-PnP'
+          EventID:
+              - 400
+              - 410
+          DeviceInstanceId|startswith: 'SWD\WPDBUSENUM\'
+        - Provider_Name: 'Microsoft-Windows-Security-Auditing'
+          EventID: 6416
+          ClassName: 'WPD'
+    filter_storage:
+        - DeviceInstanceId|contains: 'USBSTOR'
+        - DeviceId|contains: 'USBSTOR'
+    condition: selection and not filter_storage
+level: high
+---
+title: Подключен USB-модем или сетевой адаптер
+id: 48d0c825-5d83-51e1-99ca-b120cf288f6e
+status: stable
+description: Подключено сетевое USB-устройство (модем, Wi-Fi/Ethernet-адаптер, смартфон в режиме модема) — возможный неучтенный канал связи из сегмента АСУ ТП.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Сеть и периферия
+fstec239: [ЗИС, УПД]
+fields:
+    - ID устройства=DeviceInstanceId
+    - Драйвер=DriverName
+    - ID=DeviceId
+    - Устройство=DeviceDescription
+logsource:
+    product: windows
+detection:
+    selection:
+        - Provider_Name: 'Microsoft-Windows-Kernel-PnP'
+          EventID:
+              - 400
+              - 410
+          ClassGuid: '{4d36e972-e325-11ce-bfc1-08002be10318}'
+          DeviceInstanceId|startswith: 'USB\'
+        - Provider_Name: 'Microsoft-Windows-Security-Auditing'
+          EventID: 6416
+          ClassName: 'Net'
+          DeviceId|startswith: 'USB\'
+    condition: selection
+level: high
+---
+title: Установка устройства запрещена политикой
+id: 1fb25e17-9629-59af-b9f0-263da6e4e4d4
+status: stable
+description: Политика запретила установку устройства (Security 6423) — была попытка подключить запрещенное устройство.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Съемные носители
+fstec239: [ЗНИ]
+fields:
+    - Устройство=DeviceDescription
+    - ID=DeviceId
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 6423
+    condition: selection
+level: high
+---
+title: Подключение к сети Wi-Fi
+id: 31f9c6c6-d2c6-56a4-a737-b2af5aa5a079
+status: stable
+description: Компьютер подключился к беспроводной сети. Для АРМ и серверов АСУ ТП беспроводные подключения, как правило, запрещены.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Сеть и периферия
+fstec239: [ЗИС]
+fields:
+    - Сеть=SSID
+    - Адаптер=InterfaceDescription
+    - Профиль=ProfileName
+logsource:
+    product: windows
+    service: wlan-autoconfig
+detection:
+    selection:
+        EventID: 8001
+    condition: selection
+level: high
+---
+title: Печать документа
+id: 2a00ae2f-17bd-5c7e-8f27-cb48a454523c
+status: stable
+description: Документ отправлен на печать (журнал PrintService/Operational, если включен).
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Сеть и периферия
+fstec239: [ЗНИ]
+fields:
+    - Документ=Param2
+    - Пользователь=Param3
+    - Принтер=Param5
+    - Страниц=Param8
+logsource:
+    product: windows
+    service: printservice-operational
+detection:
+    selection:
+        EventID: 307
+    condition: selection
+level: low
+---
+title: Установлена программа (Windows Installer)
+id: fb17a6ee-febd-5f30-b71d-926a0225ac19
+status: stable
+description: Установлен программный продукт. Состав ПО АРМ и серверов АСУ ТП меняется только по заявке и после проверки.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Установка ПО и служб
+fstec239: [ОПС]
+fields:
+    - Продукт=Data0
+    - Версия=Data1
+    - Производитель=Data4
+    - Код результата=Data3
+logsource:
+    product: windows
+    service: application
+detection:
+    selection:
+        Provider_Name: 'MsiInstaller'
+        EventID: 1033
+    condition: selection
+falsepositives:
+    - Установка ПО по заявке, обновление прикладного ПО поставщиком
+level: high
+---
+title: Удалена программа (Windows Installer)
+id: 1d315c1f-e4a6-53cb-b7c0-bc9280a2926a
+status: stable
+description: Программный продукт удален.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Установка ПО и служб
+fstec239: [ОПС]
+fields:
+    - Продукт=Data0
+    - Версия=Data1
+    - Производитель=Data4
+    - Код результата=Data3
+logsource:
+    product: windows
+    service: application
+detection:
+    selection:
+        Provider_Name: 'MsiInstaller'
+        EventID: 1034
+    condition: selection
+level: high
+---
+title: Изменена или обновлена программа (Windows Installer)
+id: 9e8581c1-4021-58e4-b0c5-38e1acf23e93
+status: stable
+description: Установлено обновление или изменен состав компонентов программного продукта.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Установка ПО и служб
+fstec239: [ОПС]
+fields:
+    - Продукт=Data0
+    - Обновление=Data1
+logsource:
+    product: windows
+    service: application
+detection:
+    selection:
+        Provider_Name: 'MsiInstaller'
+        EventID:
+            - 1022
+            - 1035
+    condition: selection
+level: low
+---
+title: Установлена служба
+id: 16a0574b-4218-505a-9c5b-6b21bf7acb82
+status: stable
+description: В системе зарегистрирована новая служба. Проверить путь, учетную запись запуска и основание установки.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.persistence
+    - attack.t1543.003
+evtxa_group: Установка ПО и служб
+fstec239: [ОПС]
+fields:
+    - Служба=ServiceName
+    - Путь=ImagePath
+    - Тип=ServiceType
+    - Запуск=StartType
+    - УЗ службы=AccountName
+logsource:
+    product: windows
+    service: system
+detection:
+    selection:
+        Provider_Name: 'Service Control Manager'
+        EventID: 7045
+    condition: selection
+falsepositives:
+    - Установка ПО по заявке, обновления драйверов
+level: high
+---
+title: Установлен драйвер
+id: 50e0beb0-491a-5158-be9d-14a65ce7128c
+status: stable
+description: Зарегистрирована служба драйвера режима ядра или файловой системы.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Установка ПО и служб
+fstec239: [ОПС]
+fields:
+    - Служба=ServiceName
+    - Путь=ImagePath
+    - Тип=ServiceType
+logsource:
+    product: windows
+    service: system
+detection:
+    selection:
+        Provider_Name: 'Service Control Manager'
+        EventID: 7045
+        ServiceType|contains:
+            - 'kernel'
+            - 'file system'
+            - 'драйвер'
+    condition: selection
+level: high
+---
+title: Изменен тип запуска службы
+id: 0963473a-a196-5e5e-ad1b-aff101c088ff
+status: stable
+description: Тип запуска службы изменен (например, автоматический на отключенный). Может нарушить работу технологического ПО.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Установка ПО и служб
+fstec239: [ОПС, ОДТ]
+fields:
+    - Служба=param1
+    - Было=param2
+    - Стало=param3
+    - Имя службы=param4
+logsource:
+    product: windows
+    service: system
+detection:
+    selection:
+        Provider_Name: 'Service Control Manager'
+        EventID: 7040
+    filter_bits:
+        param4:
+            - 'BITS'
+            - 'TrustedInstaller'
+            - 'wuauserv'
+    condition: selection and not filter_bits
+falsepositives:
+    - Установка и обновление ПО
+level: medium
+---
+title: Отключена служба защиты или журналирования
+id: 55c7a637-80df-5286-a3db-df97e7e5bb8d
+status: stable
+description: Служба антивируса, брандмауэра, журнала событий или Sysmon переведена в состояние «Отключена».
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.defense-evasion
+    - attack.t1562.001
+evtxa_group: Средства защиты
+fstec239: [АВЗ, АУД]
+fields:
+    - Служба=param1
+    - Было=param2
+    - Стало=param3
+    - Имя службы=param4
+logsource:
+    product: windows
+    service: system
+detection:
+    selection:
+        Provider_Name: 'Service Control Manager'
+        EventID: 7040
+        param4:
+            - 'WinDefend'
+            - 'Sense'
+            - 'WdNisSvc'
+            - 'MpsSvc'
+            - 'EventLog'
+            - 'wscsvc'
+            - 'SecurityHealthService'
+            - 'Sysmon'
+            - 'Sysmon64'
+        param3|contains:
+            - 'disabled'
+            - 'Отключ'
+    condition: selection
+level: high
+---
+title: Установлено обновление Windows
+id: fb1b3223-a362-52b4-b1ee-949e301b3a6b
+status: stable
+description: Установлено обновление Windows (кроме обновлений сигнатур антивируса). На объектах АСУ ТП обновления устанавливаются после проверки совместимости.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Установка ПО и служб
+fstec239: [ОПС]
+fields:
+    - Обновление=updateTitle
+logsource:
+    product: windows
+    service: system
+detection:
+    selection:
+        Provider_Name: 'Microsoft-Windows-WindowsUpdateClient'
+        EventID: 19
+    filter_signatures:
+        updateTitle|contains:
+            - 'KB2267602'
+            - 'KB4052623'
+            - 'KB915597'
+            - 'Security Intelligence Update'
+            - 'Definition Update'
+            - 'аналитики системы безопасности'
+            - 'определений'
+    condition: selection and not filter_signatures
+level: low
+---
+title: Создано задание планировщика
+id: c17f6dd1-700c-5def-b4b3-c38e77876f07
+status: stable
+description: Пользователь создал задание планировщика.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.persistence
+    - attack.t1053.005
+evtxa_group: Установка ПО и служб
+fstec239: [ОПС]
+fields:
+    - Задание=TaskName
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4698
+    filter_system:
+        SubjectUserSid:
+            - 'S-1-5-18'
+            - 'S-1-5-19'
+            - 'S-1-5-20'
+    condition: selection and not filter_system
+level: medium
+---
+title: Запуск программы заблокирован (AppLocker)
+id: 22825507-0724-5d35-9859-013ec14d443a
+status: stable
+description: AppLocker запретил запуск программы или сценария вне разрешенного перечня — попытка запустить постороннее ПО.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Запуск программ
+fstec239: [ОПС]
+fields:
+    - Файл=FilePath
+    - Пользователь=TargetUser
+    - Издатель=Fqbn
+logsource:
+    product: windows
+    service: applocker
+detection:
+    selection:
+        EventID:
+            - 8004
+            - 8007
+    condition: selection
+level: high
+---
+title: Запуск программы вне разрешенного перечня (AppLocker, аудит)
+id: fa9cc403-ddf2-58cd-a7ec-300656f9e6d3
+status: stable
+description: AppLocker в режиме аудита зафиксировал программу, которая была бы запрещена.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Запуск программ
+fstec239: [ОПС]
+fields:
+    - Файл=FilePath
+    - Пользователь=TargetUser
+    - Издатель=Fqbn
+logsource:
+    product: windows
+    service: applocker
+detection:
+    selection:
+        EventID:
+            - 8003
+            - 8006
+    condition: selection
+level: medium
+---
+title: Заблокирован код без допустимой подписи (Code Integrity)
+id: e81899ee-9754-5ebd-a89a-a6f258efaf80
+status: stable
+description: Контроль целостности кода (WDAC) заблокировал или отметил файл без допустимой подписи.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Запуск программ
+fstec239: [ОПС]
+fields:
+    - Файл=FileNameBuffer
+    - Процесс=ProcessNameBuffer
+logsource:
+    product: windows
+    service: codeintegrity-operational
+detection:
+    selection:
+        EventID:
+            - 3077
+            - 3033
+    condition: selection
+level: medium
+---
+title: Запущен Windows PowerShell
+id: 78f715eb-34c0-58a2-a305-1a15f4165a79
+status: stable
+description: Запущен движок Windows PowerShell (журнал Windows PowerShell, событие 400). Операторам АСУ ТП командная оболочка обычно не нужна.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Запуск программ
+fstec239: [ОПС]
+fields:
+    - Сведения=Data2
+logsource:
+    product: windows
+    service: powershell-classic
+detection:
+    selection:
+        EventID: 400
+    condition: selection
+falsepositives:
+    - Сценарии администрирования и обслуживающего ПО
+level: low
+---
+title: Defender обнаружил вредоносное ПО
+id: 39c22e46-a0bd-52bd-8092-91dbfdc3c099
+status: stable
+description: Антивирус Microsoft Defender обнаружил угрозу (часто — занесенную на съемном носителе).
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.execution
+    - attack.t1204
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Угроза=Threat Name
+    - Путь=Path
+    - Процесс=Process Name
+    - Пользователь=Detection User
+logsource:
+    product: windows
+    service: windefend
+detection:
+    selection:
+        EventID:
+            - 1006
+            - 1116
+            - 1015
+    condition: selection
+level: high
+---
+title: Defender не смог обезвредить угрозу
+id: 4a08b62c-75e2-5bc4-9c82-3e07a3b96520
+status: stable
+description: Действие над угрозой завершилось ошибкой — объект может оставаться активным.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Угроза=Threat Name
+    - Путь=Path
+    - Ошибка=Error Description
+logsource:
+    product: windows
+    service: windefend
+detection:
+    selection:
+        EventID:
+            - 1008
+            - 1118
+            - 1119
+    condition: selection
+level: critical
+---
+title: Отключена защита Defender
+id: 086a4c3e-13ba-5222-aac3-4faf7b293a2b
+status: stable
+description: Отключена защита в реальном времени или сканирование.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.defense-evasion
+    - attack.t1562.001
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+logsource:
+    product: windows
+    service: windefend
+detection:
+    selection:
+        EventID:
+            - 5001
+            - 5010
+            - 5012
+    condition: selection
+falsepositives:
+    - Установлен другой антивирус
+level: high
+---
+title: Добавлено исключение Defender
+id: 8fcb701d-ce80-5d4f-aaaa-5b58f10e4340
+status: stable
+description: В настройки антивируса добавлено исключение (путь, расширение или процесс) — эти объекты не проверяются.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.defense-evasion
+    - attack.t1562.001
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Новое значение=New Value
+logsource:
+    product: windows
+    service: windefend
+detection:
+    selection:
+        EventID: 5007
+        New Value|contains: '\Exclusions\'
+    condition: selection
+level: high
+---
+title: Защита от изменений Defender заблокировала изменение
+id: d02320d3-e067-548f-ba0b-b4058bd665cd
+status: stable
+description: Кто-то пытался изменить защищенную настройку антивируса.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+logsource:
+    product: windows
+    service: windefend
+detection:
+    selection:
+        EventID: 5013
+    condition: selection
+level: medium
+---
+title: Изменены параметры брандмауэра Windows
+id: e84573ed-e86d-575f-b205-6e9a1bf27261
+status: stable
+description: Изменен параметр профиля брандмауэра (в том числе его отключение).
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Средства защиты
+fstec239: [ЗИС]
+logsource:
+    product: windows
+    service: firewall-as
+detection:
+    selection:
+        EventID: 2003
+    condition: selection
+level: medium
+---
+title: Изменено правило брандмауэра Windows
+id: 2c8bc574-4772-586b-8e73-8849e86a4d07
+status: stable
+description: Добавлено, изменено или удалено правило брандмауэра.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Средства защиты
+fstec239: [ЗИС]
+logsource:
+    product: windows
+    service: firewall-as
+detection:
+    selection:
+        EventID:
+            - 2004
+            - 2005
+            - 2006
+    condition: selection
+falsepositives:
+    - Установка ПО, групповая политика
+level: low
+---
+title: Очищен журнал Security
+id: 7bb5e9e6-1679-595a-b536-7d3698f012f4
+status: stable
+description: Журнал безопасности очищен — предшествующие события уничтожены.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.defense-evasion
+    - attack.t1070.001
+evtxa_group: Журналы и аудит
+fstec239: [АУД]
+fields:
+    - Кто=SubjectUserName
+    - Домен=SubjectDomainName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        Provider_Name: 'Microsoft-Windows-Eventlog'
+        EventID: 1102
+    condition: selection
+level: high
+---
+title: Очищен журнал событий
+id: 3fee54ca-3f18-50a6-a402-36cc64c64ac7
+status: stable
+description: Очищен журнал System, Application или другой журнал.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.defense-evasion
+    - attack.t1070.001
+evtxa_group: Журналы и аудит
+fstec239: [АУД]
+fields:
+    - Журнал=Channel
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: system
+detection:
+    selection:
+        Provider_Name: 'Microsoft-Windows-Eventlog'
+        EventID: 104
+    condition: selection
+level: high
+---
+title: Изменена политика аудита
+id: 3b1825a5-ac14-5c93-ba6f-5d63da1399ec
+status: stable
+description: Пользователь изменил политику аудита (применение групповой политики от имени SYSTEM исключено).
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.defense-evasion
+    - attack.t1562.002
+evtxa_group: Журналы и аудит
+fstec239: [АУД]
+fields:
+    - Кто=SubjectUserName
+    - Подкатегория=SubcategoryGuid
+    - Изменения=AuditPolicyChanges
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4719
+    filter_system:
+        SubjectUserSid:
+            - 'S-1-5-18'
+            - 'S-1-5-19'
+            - 'S-1-5-20'
+    condition: selection and not filter_system
+level: high
+---
+title: Потеряны события аудита или журнал переполнен
+id: 67ebd657-c71f-537c-8ca5-3fac9fb88caf
+status: stable
+description: Служба журнала сообщила о потере событий или заполнении журнала Security.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Журналы и аудит
+fstec239: [АУД]
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        Provider_Name: 'Microsoft-Windows-Eventlog'
+        EventID:
+            - 1101
+            - 1104
+    condition: selection
+level: medium
+---
+title: Перезагрузка или выключение по инициативе пользователя
+id: 7ba87432-1055-55d4-b0a9-d484a8ac4b23
+status: stable
+description: Пользователь или программа от его имени перезагрузили либо выключили компьютер (User32 1074). Перезапуск АРМ или сервера АСУ ТП влияет на технологический процесс.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Перезагрузки и сбои
+fstec239: [ОДТ]
+fields:
+    - Процесс=param1
+    - Причина=param3
+    - Действие=param5
+    - Комментарий=param6
+    - Пользователь=param7
+logsource:
+    product: windows
+    service: system
+detection:
+    selection:
+        Provider_Name: 'User32'
+        EventID: 1074
+    filter_system:
+        param7|endswith:
+            - '\SYSTEM'
+            - '\СИСТЕМА'
+    condition: selection and not filter_system
+falsepositives:
+    - Плановое обслуживание
+level: medium
+---
+title: Аварийное выключение компьютера
+id: 03db5280-2092-5917-a24f-3707953819a5
+status: stable
+description: Предыдущее завершение работы было неожиданным (питание, зависание, сбой).
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Перезагрузки и сбои
+fstec239: [ОДТ]
+logsource:
+    product: windows
+detection:
+    selection:
+        - Provider_Name: 'Microsoft-Windows-Kernel-Power'
+          EventID: 41
+        - Provider_Name: 'EventLog'
+          EventID: 6008
+    condition: selection
+level: medium
+---
+title: Критический сбой системы (BSOD)
+id: b518e0ef-f156-5d96-a603-0b640a7972c0
+status: stable
+description: Компьютер перезагрузился после критической ошибки (BugCheck).
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Перезагрузки и сбои
+fstec239: [ОДТ]
+logsource:
+    product: windows
+    service: system
+detection:
+    selection:
+        Provider_Name: 'Microsoft-Windows-WER-SystemErrorReporting'
+        EventID: 1001
+    condition: selection
+level: medium
+---
+title: Установлено средство удаленного доступа (служба)
+id: 2301e6af-5203-5d71-9f42-e15fcd993cc6
+status: stable
+description: Установлена служба средства удаленного доступа (TeamViewer, AnyDesk, Radmin, RMS, VNC, LiteManager, Ammyy, RustDesk и др.). В сегменте АСУ ТП это неконтролируемый канал удаленного доступа, если он не согласован.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.command-and-control
+    - attack.t1219
+evtxa_group: Удаленный доступ
+fstec239: [УПД, ОПС]
+fields:
+    - Служба=ServiceName
+    - Путь=ImagePath
+logsource:
+    product: windows
+    service: system
+detection:
+    selection:
+        Provider_Name: 'Service Control Manager'
+        EventID: 7045
+    selection_tool:
+        - ServiceName|contains:
+            - 'TeamViewer'
+            - 'AnyDesk'
+            - 'Radmin'
+            - 'RManService'
+            - 'Remote Manipulator'
+            - 'Remote Utilities'
+            - 'LiteManager'
+            - 'ROMServer'
+            - 'Ammyy'
+            - 'AeroAdmin'
+            - 'Splashtop'
+            - 'ScreenConnect'
+            - 'RustDesk'
+            - 'RuDesktop'
+            - 'DWAgent'
+            - 'NetSupport'
+            - 'DameWare'
+            - 'Mesh Agent'
+            - 'AteraAgent'
+            - 'TightVNC'
+            - 'UltraVNC'
+            - 'uvnc_service'
+            - 'RealVNC'
+            - 'VNC Server'
+            - 'Chrome Remote Desktop'
+            - 'LogMeIn'
+            - 'GoToAssist'
+            - 'Getscreen'
+            - 'AnyViewer'
+            - 'ToDesk'
+            - 'Supremo'
+            - 'NoMachine'
+        - ImagePath|contains:
+            - 'TeamViewer'
+            - 'AnyDesk'
+            - 'rserver3'
+            - 'rutserv'
+            - 'rfusclient'
+            - 'LiteManager'
+            - 'ROMServer'
+            - 'ROMViewer'
+            - 'Ammyy'
+            - 'AeroAdmin'
+            - 'Splashtop'
+            - 'ScreenConnect'
+            - 'rustdesk'
+            - 'rudesktop'
+            - 'dwagent'
+            - 'client32.exe'
+            - 'DWRCS'
+            - 'MeshAgent'
+            - 'AteraAgent'
+            - 'tvnserver'
+            - 'winvnc'
+            - 'vncserver'
+            - 'vncviewer'
+            - 'remoting_host'
+            - 'LogMeIn'
+            - 'g2ax_'
+            - 'getscreen'
+            - 'AnyViewer'
+            - 'ToDesk'
+            - 'Supremo'
+            - 'nxservice'
+            - 'nxplayer'
+    condition: selection and selection_tool
+falsepositives:
+    - Согласованное средство удаленного обслуживания поставщика (должно быть учтено)
+level: high
+---
+title: Установлено средство удаленного доступа (служба, Security 4697)
+id: f0927a96-a93c-54df-8920-1e14784c7d30
+status: stable
+description: Установлена служба средства удаленного доступа (по журналу Security 4697).
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.command-and-control
+    - attack.t1219
+evtxa_group: Удаленный доступ
+fstec239: [УПД, ОПС]
+fields:
+    - Служба=ServiceName
+    - Путь=ServiceFileName
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4697
+    selection_tool:
+        - ServiceName|contains:
+            - 'TeamViewer'
+            - 'AnyDesk'
+            - 'Radmin'
+            - 'RManService'
+            - 'Remote Manipulator'
+            - 'Remote Utilities'
+            - 'LiteManager'
+            - 'ROMServer'
+            - 'Ammyy'
+            - 'AeroAdmin'
+            - 'Splashtop'
+            - 'ScreenConnect'
+            - 'RustDesk'
+            - 'RuDesktop'
+            - 'DWAgent'
+            - 'NetSupport'
+            - 'DameWare'
+            - 'Mesh Agent'
+            - 'AteraAgent'
+            - 'TightVNC'
+            - 'UltraVNC'
+            - 'uvnc_service'
+            - 'RealVNC'
+            - 'VNC Server'
+            - 'Chrome Remote Desktop'
+            - 'LogMeIn'
+            - 'GoToAssist'
+            - 'Getscreen'
+            - 'AnyViewer'
+            - 'ToDesk'
+            - 'Supremo'
+            - 'NoMachine'
+        - ServiceFileName|contains:
+            - 'TeamViewer'
+            - 'AnyDesk'
+            - 'rserver3'
+            - 'rutserv'
+            - 'rfusclient'
+            - 'LiteManager'
+            - 'ROMServer'
+            - 'ROMViewer'
+            - 'Ammyy'
+            - 'AeroAdmin'
+            - 'Splashtop'
+            - 'ScreenConnect'
+            - 'rustdesk'
+            - 'rudesktop'
+            - 'dwagent'
+            - 'client32.exe'
+            - 'DWRCS'
+            - 'MeshAgent'
+            - 'AteraAgent'
+            - 'tvnserver'
+            - 'winvnc'
+            - 'vncserver'
+            - 'vncviewer'
+            - 'remoting_host'
+            - 'LogMeIn'
+            - 'g2ax_'
+            - 'getscreen'
+            - 'AnyViewer'
+            - 'ToDesk'
+            - 'Supremo'
+            - 'nxservice'
+            - 'nxplayer'
+    condition: selection and selection_tool
+level: high
+---
+title: Установлено средство удаленного доступа (Windows Installer)
+id: 9c3a9ea1-88d2-53b4-90bd-33732662ceb7
+status: stable
+description: Через Windows Installer установлен продукт удаленного доступа.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.command-and-control
+    - attack.t1219
+evtxa_group: Удаленный доступ
+fstec239: [УПД, ОПС]
+fields:
+    - Продукт=Data0
+    - Версия=Data1
+logsource:
+    product: windows
+    service: application
+detection:
+    selection:
+        Provider_Name: 'MsiInstaller'
+        EventID: 1033
+    keywords:
+        - 'TeamViewer'
+        - 'AnyDesk'
+        - 'Radmin'
+        - 'RManService'
+        - 'Remote Manipulator'
+        - 'Remote Utilities'
+        - 'LiteManager'
+        - 'ROMServer'
+        - 'Ammyy'
+        - 'AeroAdmin'
+        - 'Splashtop'
+        - 'ScreenConnect'
+        - 'RustDesk'
+        - 'RuDesktop'
+        - 'DWAgent'
+        - 'NetSupport'
+        - 'DameWare'
+        - 'Mesh Agent'
+        - 'AteraAgent'
+        - 'TightVNC'
+        - 'UltraVNC'
+        - 'uvnc_service'
+        - 'RealVNC'
+        - 'VNC Server'
+        - 'Chrome Remote Desktop'
+        - 'LogMeIn'
+        - 'GoToAssist'
+        - 'Getscreen'
+        - 'AnyViewer'
+        - 'ToDesk'
+        - 'Supremo'
+        - 'NoMachine'
+    condition: selection and keywords
+level: high
+---
+title: Служба удаленного выполнения (PsExec, Impacket)
+id: 1a17a660-9687-5134-b61b-218aca5e84ff
+status: stable
+description: Служба запускает командный интерпретатор или пишет в административный общий ресурс — след PsExec, Impacket, Cobalt Strike.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.lateral-movement
+    - attack.t1569.002
+    - attack.t1021.002
+evtxa_group: Признаки атаки
+fstec239: [ОПС, УПД]
+fields:
+    - Служба=ServiceName
+    - Путь=ImagePath
+logsource:
+    product: windows
+    service: system
+detection:
+    selection:
+        Provider_Name: 'Service Control Manager'
+        EventID: 7045
+    selection_cmd:
+        - ImagePath|contains:
+              - '%COMSPEC%'
+              - 'cmd.exe /c'
+              - 'cmd /c'
+              - 'cmd.exe /Q /c'
+              - '\\127.0.0.1\'
+              - '\ADMIN$'
+              - '\__output'
+              - 'powershell'
+              - 'mshta'
+              - 'rundll32'
+        - ServiceName|contains:
+              - 'PSEXESVC'
+              - 'RemComSvc'
+              - 'csexec'
+              - 'winexesvc'
+    condition: selection and selection_cmd
+level: critical
+---
+title: Изменение SID History
+id: 80988846-6dfc-50ab-8e1b-c1ced496d51e
+status: stable
+description: К учетной записи добавлен SID History — способ получить права другой учетной записи.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.privilege-escalation
+    - attack.t1134.005
+evtxa_group: Признаки атаки
+fstec239: [УПД]
+fields:
+    - УЗ=TargetUserName
+    - SID History=SidHistory
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID:
+            - 4765
+            - 4766
+    condition: selection
+level: critical
+---
+title: Overpass-the-Hash / Pass-the-Hash (вход типа 9 через seclogo)
+id: e9e2cc91-09cf-5e88-a117-21600ad09f64
+status: stable
+description: Вход с новыми учетными данными (тип 9) процессом seclogo с пакетом Negotiate — так выглядит запуск процесса с подставленным хешем пароля и runas /netonly.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.lateral-movement
+    - attack.t1550.002
+evtxa_group: Признаки атаки
+fstec239: [ИАФ, УПД]
+fields:
+    - УЗ=TargetUserName
+    - Процесс=ProcessName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4624
+        LogonType: 9
+        LogonProcessName: 'seclogo'
+        AuthenticationPackageName: 'Negotiate'
+    condition: selection
+falsepositives:
+    - runas /netonly администратором
+level: high
+---
+# ---------------------------------------------------------------- базовые правила цепочек
+# Сами по себе не выводятся (level informational): только шаги корреляций ниже.
+title: Подключен носитель или телефон (шаг цепочки)
+id: 9793b099-26fb-5bea-8724-8bac159987f1
+name: evtxa_media
+status: stable
+description: Базовое правило корреляций.
+author: EVTX Audit
+date: 2026-10-14
+logsource:
+    product: windows
+detection:
+    selection:
+        - Provider_Name: 'Microsoft-Windows-Kernel-PnP'
+          EventID:
+              - 400
+              - 410
+          DeviceInstanceId|startswith:
+              - 'USBSTOR\'
+              - 'SWD\WPDBUSENUM\'
+        - Provider_Name: 'Microsoft-Windows-Partition'
+          EventID: 1006
+          BusType:
+              - 7
+              - 12
+              - 13
+        - Provider_Name: 'Microsoft-Windows-Security-Auditing'
+          EventID: 6416
+          ClassName:
+              - 'DiskDrive'
+              - 'WPD'
+    condition: selection
 level: informational
 ---
-title: Запрос билета TGS со слабым шифрованием RC4
-id: f04b9233-fce7-4cf3-8b34-79e5bd6ef906
-name: evtxa_kerberos_rc4_tgs
-status: test
-description: Выдан билет службы Kerberos (4769) с шифрованием RC4 (0x17) для пользовательской службы. Базовое правило для корреляции Kerberoasting.
+title: Установлены программа или служба (шаг цепочки)
+id: 270c2cc2-9dc5-571b-aab3-3b6390e85be9
+name: evtxa_install
+status: stable
+description: Базовое правило корреляций.
 author: EVTX Audit
-date: 2026-10-08
+date: 2026-10-14
+logsource:
+    product: windows
+detection:
+    selection:
+        - Provider_Name: 'MsiInstaller'
+          EventID: 1033
+        - Provider_Name: 'Service Control Manager'
+          EventID: 7045
+        - Provider_Name: 'Microsoft-Windows-Security-Auditing'
+          EventID: 4697
+    condition: selection
+level: informational
+---
+title: Очищен журнал (шаг цепочки)
+id: ea71f63f-800f-5288-8585-b188790b8426
+name: evtxa_log_cleared
+status: stable
+description: Базовое правило корреляций.
+author: EVTX Audit
+date: 2026-10-14
+logsource:
+    product: windows
+detection:
+    selection:
+        Provider_Name: 'Microsoft-Windows-Eventlog'
+        EventID:
+            - 1102
+            - 104
+    condition: selection
+level: informational
+---
+title: Время изменено пользователем (шаг цепочки)
+id: d76c29ac-ff00-59da-ab81-f813d497682a
+name: evtxa_time_changed
+status: stable
+description: Базовое правило корреляций.
+author: EVTX Audit
+date: 2026-10-14
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4616
+    filter_system:
+        SubjectUserSid:
+            - 'S-1-5-18'
+            - 'S-1-5-19'
+            - 'S-1-5-20'
+    condition: selection and not filter_system
+level: informational
+---
+title: Ослаблена защита (шаг цепочки)
+id: aff03937-5dcd-5925-88a5-5b602d0abb14
+name: evtxa_protection_off
+status: stable
+description: Базовое правило корреляций.
+author: EVTX Audit
+date: 2026-10-14
+logsource:
+    product: windows
+detection:
+    selection:
+        - Provider_Name: 'Microsoft-Windows-Windows Defender'
+          EventID:
+              - 5001
+              - 5010
+              - 5012
+        - Provider_Name: 'Microsoft-Windows-Windows Defender'
+          EventID: 5007
+          New Value|contains: '\Exclusions\'
+        - Provider_Name: 'Service Control Manager'
+          EventID: 7040
+          param4:
+              - 'WinDefend'
+              - 'MpsSvc'
+              - 'EventLog'
+          param3|contains:
+              - 'disabled'
+              - 'Отключ'
+    condition: selection
+level: informational
+---
+title: Создана УЗ (шаг цепочки)
+id: acbcab34-46f0-5ddc-87b5-fa66208afbc9
+name: evtxa_account_created
+status: stable
+description: Базовое правило корреляций.
+author: EVTX Audit
+date: 2026-10-14
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4720
+    condition: selection
+level: informational
+---
+title: Удалена УЗ (шаг цепочки)
+id: 3ed7b383-eb8d-54f0-b395-8bcafcd26ae1
+name: evtxa_account_deleted
+status: stable
+description: Базовое правило корреляций.
+author: EVTX Audit
+date: 2026-10-14
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4726
+    condition: selection
+level: informational
+---
+title: Включена УЗ (шаг цепочки)
+id: ef59f1c4-9f77-5c4e-8fbc-32cfea718d14
+name: evtxa_account_enabled
+status: stable
+description: Базовое правило корреляций.
+author: EVTX Audit
+date: 2026-10-14
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4722
+    condition: selection
+level: informational
+---
+title: Отключена УЗ (шаг цепочки)
+id: 83556110-7e23-50c9-81ea-f73c21411533
+name: evtxa_account_disabled
+status: stable
+description: Базовое правило корреляций.
+author: EVTX Audit
+date: 2026-10-14
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4725
+    condition: selection
+level: informational
+---
+title: Неудачный вход (шаг цепочки)
+id: ab1e5d6d-491c-5a6c-8a53-ccafeb7e7e24
+name: evtxa_failed_logon
+status: stable
+description: Базовое правило корреляций.
+author: EVTX Audit
+date: 2026-10-14
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4625
+    condition: selection
+level: informational
+---
+title: Неудачная проверка пароля на DC (шаг цепочки)
+id: 312e1184-6524-5a5c-b3b6-f1f55be9f589
+name: evtxa_failed_dc
+status: stable
+description: Базовое правило корреляций (Kerberos 4771, NTLM 4776).
+author: EVTX Audit
+date: 2026-10-14
+logsource:
+    product: windows
+    service: security
+detection:
+    selection_kerberos:
+        EventID: 4771
+    selection_ntlm:
+        EventID: 4776
+    filter_success:
+        Status: '0x0'
+    condition: 1 of selection_* and not filter_success
+level: informational
+---
+title: RDP-вход (шаг цепочки)
+id: 055a2ab9-04f3-5099-ad98-8128259d9130
+name: evtxa_rdp_logon
+status: stable
+description: Базовое правило корреляций.
+author: EVTX Audit
+date: 2026-10-14
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4624
+        LogonType: 10
+    condition: selection
+level: informational
+---
+title: Запрос TGS с RC4 (шаг цепочки)
+id: 03fc0888-6012-54f7-b259-dc7e99c8865b
+name: evtxa_kerberos_rc4_tgs
+status: stable
+description: Базовое правило корреляций.
+author: EVTX Audit
+date: 2026-10-14
 logsource:
     product: windows
     service: security
@@ -4012,131 +6210,13 @@ detection:
     condition: selection and not filter_machine and not filter_krbtgt
 level: informational
 ---
-title: Создано задание планировщика
-id: bebe2a07-7f59-42f0-9d19-9b0e6fbb73fd
-name: evtxa_task_created
-status: test
-description: Создано задание планировщика (4698). Базовое правило для корреляций.
+title: Обнаружена угроза (шаг цепочки)
+id: d15c9d5b-c7de-5099-a3ab-30a29699b6fe
+name: evtxa_av_detection
+status: stable
+description: Базовое правило корреляций.
 author: EVTX Audit
-date: 2026-10-08
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 4698
-    condition: selection
-level: informational
----
-title: Удалено задание планировщика
-id: b4e2889c-b3c9-4fd4-9f6f-385ae61acdba
-name: evtxa_task_deleted
-status: test
-description: Удалено задание планировщика (4699). Базовое правило для корреляций.
-author: EVTX Audit
-date: 2026-10-08
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 4699
-    condition: selection
-level: informational
----
-title: Закрепление (служба, задание или учетная запись)
-id: ce65d9d0-bacb-4d95-a509-497e4396b2c8
-name: evtxa_persistence_security
-status: test
-description: Установка службы (4697), создание задания (4698) или учетной записи (4720) по журналу Security. Базовое правило для корреляций.
-author: EVTX Audit
-date: 2026-10-08
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID:
-            - 4697
-            - 4698
-            - 4720
-    condition: selection
-level: informational
----
-title: Установлена служба
-id: dcf0eb8d-f928-4083-ba74-42e820cefe96
-name: evtxa_service_installed
-status: test
-description: Установлена служба (System 7045). Базовое правило для корреляций.
-author: EVTX Audit
-date: 2026-10-08
-logsource:
-    product: windows
-    service: system
-detection:
-    selection:
-        Provider_Name: 'Service Control Manager'
-        EventID: 7045
-    condition: selection
-level: informational
----
-title: Очищен журнал Security
-id: 44c81f46-3495-4c22-aef6-646ccd9c0cb4
-name: evtxa_security_log_cleared
-status: test
-description: Очищен журнал Security (1102). Базовое правило для корреляций.
-author: EVTX Audit
-date: 2026-10-08
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        Provider_Name: 'Microsoft-Windows-Eventlog'
-        EventID: 1102
-    condition: selection
-level: informational
----
-title: Очищен журнал System или Application
-id: 9c34d675-cabe-4d8e-917e-0801958ff669
-name: evtxa_system_log_cleared
-status: test
-description: Очищен журнал (System 104). Базовое правило для корреляций.
-author: EVTX Audit
-date: 2026-10-08
-logsource:
-    product: windows
-    service: system
-detection:
-    selection:
-        Provider_Name: 'Microsoft-Windows-Eventlog'
-        EventID: 104
-    condition: selection
-level: informational
----
-title: Изменена политика аудита
-id: 0e7d3eec-6f85-4e60-8809-f351b301ee69
-name: evtxa_audit_policy_changed
-status: test
-description: Изменена системная политика аудита (4719). Базовое правило для корреляций.
-author: EVTX Audit
-date: 2026-10-08
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 4719
-    condition: selection
-level: informational
----
-title: Defender обнаружил угрозу
-id: 58997515-919b-4bbf-8f55-0e4acd17f8a9
-name: evtxa_defender_detection
-status: test
-description: Обнаружение вредоносного ПО Microsoft Defender (1006, 1015, 1116). Базовое правило для корреляций.
-author: EVTX Audit
-date: 2026-10-08
+date: 2026-10-14
 logsource:
     product: windows
     service: windefend
@@ -4144,300 +6224,121 @@ detection:
     selection:
         EventID:
             - 1006
-            - 1015
             - 1116
     condition: selection
 level: informational
 ---
-title: Defender обработал угрозу
-id: a83d3ab2-7c29-49ff-94c3-5285cb235f64
-name: evtxa_defender_action
-status: test
-description: Microsoft Defender выполнил действие над угрозой (1007, 1117). Базовое правило для корреляций.
+# ---------------------------------------------------------------- цепочки (корреляции Sigma v2)
+title: Подключение носителя → установка программы или службы
+id: fa930d4c-51da-5716-bef7-5ffc28ff44df
+status: stable
+description: В течение 30 минут после подключения съемного носителя или телефона установлена программа или служба — возможный перенос неучтенного ПО или ВПО в сегмент АСУ ТП.
 author: EVTX Audit
-date: 2026-10-08
-logsource:
-    product: windows
-    service: windefend
-detection:
-    selection:
-        EventID:
-            - 1007
-            - 1117
-    condition: selection
-level: informational
----
-title: Системное время изменено пользователем
-id: 231a4dfb-a669-4c1d-a18e-6ec468536803
-name: evtxa_time_changed_by_user
-status: test
-description: Изменение системного времени (4616) не службой времени Windows. Базовое правило для корреляций.
-author: EVTX Audit
-date: 2026-10-08
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 4616
-    filter_service:
-        SubjectUserSid:
-            - 'S-1-5-18'
-            - 'S-1-5-19'
-    condition: selection and not filter_service
-level: informational
----
-title: Подключен USB-накопитель (Kernel-PnP)
-id: 0bdc05bb-d287-498d-8739-0fb52bf185b6
-name: evtxa_usb_kernelpnp
-status: test
-description: Настроено или запущено запоминающее устройство USB либо устройство WPD (Kernel-PnP/Configuration 400, 410). Базовое правило для корреляций.
-author: EVTX Audit
-date: 2026-10-08
-logsource:
-    product: windows
-    service: kernel-pnp-configuration
-detection:
-    selection:
-        EventID:
-            - 400
-            - 410
-        DeviceInstanceId|startswith:
-            - 'USBSTOR\'
-            - 'SWD\WPDBUSENUM\'
-    condition: selection
-level: informational
----
-title: Подключен USB-накопитель (Partition)
-id: d6bfbb9b-6142-4e5e-b620-43e327fb0d62
-name: evtxa_usb_partition
-status: test
-description: Подключен диск на шине USB, SD или MMC (Partition/Diagnostic 1006). Базовое правило для корреляций.
-author: EVTX Audit
-date: 2026-10-08
-logsource:
-    product: windows
-    service: partition-diagnostic
-detection:
-    selection:
-        EventID: 1006
-        BusType:
-            - 7
-            - 12
-            - 13
-    condition: selection
-level: informational
----
-title: Распознано внешнее запоминающее устройство
-id: ceb881fe-6d64-4810-a5e6-7d5c9a9ab92d
-name: evtxa_usb_security
-status: test
-description: Распознано новое внешнее устройство хранения (Security 6416, аудит Plug and Play). Базовое правило для корреляций.
-author: EVTX Audit
-date: 2026-10-08
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 6416
-    selection_device:
-        - DeviceId|startswith:
-              - 'USBSTOR\'
-              - 'SWD\WPDBUSENUM\'
-        - ClassName:
-              - 'DiskDrive'
-              - 'WPD'
-    condition: selection and selection_device
-level: informational
----
-title: Распределенный подбор пароля к одной учетной записи
-id: 52d0d475-79de-427e-8c24-4bc739a05141
-status: test
-description: Неудачные входы одной учетной записи с пяти и более разных адресов за 30 минут — подбор пароля с нескольких узлов или ботнета. Дополняет лист «Подбор_пароля», где серии группируются по источнику.
-author: EVTX Audit
-date: 2026-10-08
+date: 2026-10-14
 tags:
-    - attack.credential-access
-    - attack.t1110
-fstec239: [ИАФ, УПД]
+    - attack.initial-access
+    - attack.t1091
+evtxa_group: Съемные носители
+fstec239: [ЗНИ, ОПС]
 correlation:
-    type: value_count
+    type: temporal_ordered
     rules:
-        - evtxa_failed_logon
-    group-by:
-        - TargetUserName
+        - evtxa_media
+        - evtxa_install
     timespan: 30m
-    condition:
-        gte: 5
-        field: IpAddress
 falsepositives:
-    - Мобильные пользователи и VPN с меняющимися адресами при устаревшем сохраненном пароле
+    - Установка ПО по заявке с учтенного носителя
 level: high
 ---
-title: Kerberoasting — массовый запрос билетов служб с RC4
-id: c007bf09-66e3-413b-ba89-a04b34538263
-status: test
-description: Одна учетная запись за 5 минут запросила билеты TGS с шифрованием RC4 для десяти и более разных служб — типичный сбор хешей для офлайн-подбора паролей сервисных учетных записей.
+title: Изменение времени → очистка журнала
+id: 5689eacc-7549-5bfc-94df-f97bc6ba9124
+status: stable
+description: В течение часа время изменено пользователем и очищен журнал — сокрытие действий.
 author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.credential-access
-    - attack.t1558.003
-fstec239: [ИАФ, УПД]
+date: 2026-10-14
+evtxa_group: Журналы и аудит
+fstec239: [АУД]
 correlation:
-    type: value_count
+    type: temporal
     rules:
-        - evtxa_kerberos_rc4_tgs
-    group-by:
-        - TargetUserName
-    timespan: 5m
-    condition:
-        gte: 10
-        field: ServiceName
-falsepositives:
-    - Устаревшие домены и приложения, работающие только с RC4
-level: high
----
-title: Одноразовое задание планировщика (удаленное выполнение, atexec)
-id: 89326f11-1bca-41b2-9fec-936cf0bf29b3
-status: test
-description: Задание планировщика создано и удалено в течение 10 минут. Так работают Impacket atexec и аналогичные средства удаленного выполнения команд.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.execution
-    - attack.lateral-movement
-    - attack.t1053.005
-fstec239: [ОПС, УПД]
-correlation:
-    type: temporal_ordered
-    rules:
-        - evtxa_task_created
-        - evtxa_task_deleted
-    group-by:
-        - TaskName
-    timespan: 10m
-falsepositives:
-    - Установщики ПО, создающие временные задания
-level: high
----
-title: Закрепление с последующей очисткой журнала Security
-id: a492bc45-711e-45b7-803d-9aaeffb857b6
-status: test
-description: После установки службы, создания задания или учетной записи в течение 2 часов очищен журнал Security — признак сокрытия следов закрепления.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.persistence
-    - attack.defense-evasion
-    - attack.t1070.001
-fstec239: [АУД, УПД]
-correlation:
-    type: temporal_ordered
-    rules:
-        - evtxa_persistence_security
-        - evtxa_security_log_cleared
-    timespan: 2h
-falsepositives:
-    - Плановое обслуживание с очисткой журналов (должно быть согласовано)
-level: high
----
-title: Установка службы с последующей очисткой журнала Security
-id: 36633cf0-2224-4ba1-85c3-9885f194fded
-status: test
-description: После установки службы (System 7045) в течение 2 часов очищен журнал Security.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.persistence
-    - attack.defense-evasion
-    - attack.t1543.003
-    - attack.t1070.001
-fstec239: [АУД, ОПС]
-correlation:
-    type: temporal_ordered
-    rules:
-        - evtxa_service_installed
-        - evtxa_security_log_cleared
-    timespan: 2h
-falsepositives:
-    - Плановое обслуживание с очисткой журналов (должно быть согласовано)
-level: high
----
-title: Установка службы с последующей очисткой журнала System
-id: eef8c318-7089-4a1f-980e-0fcea9575b49
-status: test
-description: После установки службы (7045) в течение 2 часов очищен журнал System или Application (104).
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.persistence
-    - attack.defense-evasion
-    - attack.t1543.003
-    - attack.t1070.001
-fstec239: [АУД, ОПС]
-correlation:
-    type: temporal_ordered
-    rules:
-        - evtxa_service_installed
-        - evtxa_system_log_cleared
-    timespan: 2h
-falsepositives:
-    - Плановое обслуживание с очисткой журналов (должно быть согласовано)
-level: high
----
-title: Повторное обнаружение угрозы после ее обработки
-id: 47af0b79-9c8c-4992-ab8e-04dd9571b04a
-status: test
-description: Defender обработал угрозу, но в течение суток та же угроза обнаружена снова — источник заражения или механизм закрепления не устранен.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.persistence
-    - attack.execution
-fstec239: [АВЗ]
-correlation:
-    type: temporal_ordered
-    rules:
-        - evtxa_defender_action
-        - evtxa_defender_detection
-    group-by:
-        - Threat Name
-    timespan: 1d
-falsepositives:
-    - Повторное копирование одного и того же зараженного файла пользователем
-level: high
----
-title: Множественные обнаружения вредоносного ПО на узле
-id: 1aa5dfd4-ca97-4a27-96dd-a00170271998
-status: test
-description: Пять и более обнаружений Defender на одном компьютере за час — возможная активная эпидемия или попытки запуска разных инструментов.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.execution
-fstec239: [АВЗ]
-correlation:
-    type: event_count
-    rules:
-        - evtxa_defender_detection
+        - evtxa_time_changed
+        - evtxa_log_cleared
     timespan: 1h
-    condition:
-        gte: 5
-falsepositives:
-    - Проверка архива или носителя с коллекцией вредоносных образцов
+level: high
+---
+title: Установка программы или службы → очистка журнала
+id: b403155f-5780-591f-bdcb-1f7f06765f85
+status: stable
+description: В течение 2 часов после установки ПО или службы очищен журнал — сокрытие изменений.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Журналы и аудит
+fstec239: [АУД, ОПС]
+correlation:
+    type: temporal_ordered
+    rules:
+        - evtxa_install
+        - evtxa_log_cleared
+    timespan: 2h
+level: high
+---
+title: Ослабление защиты → установка программы или службы
+id: 2f6b3296-51dc-5992-adb7-36f7d511ed95
+status: stable
+description: В течение часа после отключения антивируса, добавления исключения или отключения службы защиты установлена программа или служба.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Средства защиты
+fstec239: [АВЗ, ОПС]
+correlation:
+    type: temporal_ordered
+    rules:
+        - evtxa_protection_off
+        - evtxa_install
+    timespan: 1h
+level: high
+---
+title: Обнаружение угрозы после подключения носителя
+id: 67517380-4afd-52ee-8d45-c0daec319f16
+status: stable
+description: В течение 30 минут после подключения съемного носителя антивирус обнаружил угрозу — вероятно, ВПО занесено на носителе.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Съемные носители
+fstec239: [ЗНИ, АВЗ]
+correlation:
+    type: temporal_ordered
+    rules:
+        - evtxa_media
+        - evtxa_av_detection
+    timespan: 30m
+level: critical
+---
+title: Временная учетная запись (создана и удалена)
+id: 995e9029-d0d9-54dd-aa05-d7092c0b8a4a
+status: stable
+description: Учетная запись создана и удалена в течение суток.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Учетные записи
+fstec239: [УПД]
+correlation:
+    type: temporal_ordered
+    rules:
+        - evtxa_account_created
+        - evtxa_account_deleted
+    group-by:
+        - TargetSid
+    timespan: 1d
 level: high
 ---
 title: Временно включенная учетная запись
-id: 17b26b0c-e31a-486f-9e83-f77028496db4
-status: test
-description: Учетная запись включена и в течение суток снова отключена. Характерно для временного использования встроенного Администратора, Гостя или учетных записей подрядчиков.
+id: 859d7ac8-7535-5fce-8d46-d1e15f391f0e
+status: stable
+description: Учетная запись включена и снова отключена в течение суток — использование «спящей» УЗ.
 author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.persistence
-    - attack.t1078
+date: 2026-10-14
+evtxa_group: Учетные записи
 fstec239: [УПД]
 correlation:
     type: temporal_ordered
@@ -4447,20 +6348,99 @@ correlation:
     group-by:
         - TargetSid
     timespan: 1d
-falsepositives:
-    - Согласованное временное предоставление доступа подрядчику
 level: medium
 ---
-title: RDP-входы одной учетной записи с разных адресов
-id: 53382da5-475b-4176-ae01-4b918d320852
-status: test
-description: Одна учетная запись за час вошла по RDP с трех и более разных адресов — совместное использование учетной записи или ее компрометация.
+title: Массовое создание учетных записей
+id: dce5d52c-a057-53e4-b11a-48279aa0e930
+status: stable
+description: За час создано 3 и более учетных записей.
 author: EVTX Audit
-date: 2026-10-08
+date: 2026-10-14
+evtxa_group: Учетные записи
+fstec239: [УПД]
+correlation:
+    type: event_count
+    rules:
+        - evtxa_account_created
+    timespan: 1h
+    condition:
+        gte: 3
+level: medium
+---
+title: Многократные неудачные попытки входа одной учетной записи
+id: 26ec3fe3-f93d-5c08-a62d-69566754d7bf
+status: stable
+description: За 10 минут 5 и более неудачных входов одной учетной записи — подбор пароля или вход под чужой учетной записью.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Входы в систему
+fstec239: [ИАФ]
+correlation:
+    type: event_count
+    rules:
+        - evtxa_failed_logon
+    group-by:
+        - TargetUserName
+    timespan: 10m
+    condition:
+        gte: 5
+falsepositives:
+    - Сохраненный старый пароль в программе
+level: medium
+---
+title: Попытки входа под многими учетными записями с одного источника
+id: 372e9397-d6c4-5dd4-aeea-3dc52d4c30cd
+status: stable
+description: За 10 минут с одного адреса или компьютера были неудачные входы под 5 и более разными учетными записями — перебор учетных записей.
+author: EVTX Audit
+date: 2026-10-14
 tags:
-    - attack.lateral-movement
-    - attack.t1021.001
-    - attack.t1078
+    - attack.credential-access
+    - attack.t1110.003
+evtxa_group: Признаки атаки
+fstec239: [ИАФ]
+correlation:
+    type: value_count
+    rules:
+        - evtxa_failed_logon
+    group-by:
+        - IpAddress
+    timespan: 10m
+    condition:
+        gte: 5
+        field: TargetUserName
+level: high
+---
+title: Распределенный подбор пароля к одной учетной записи
+id: 11b95991-fbb4-5fa9-8a33-33ab81476a41
+status: stable
+description: За 30 минут неудачные проверки пароля одной учетной записи пришли с 5 и более разных компьютеров.
+author: EVTX Audit
+date: 2026-10-14
+tags:
+    - attack.credential-access
+    - attack.t1110
+evtxa_group: Признаки атаки
+fstec239: [ИАФ]
+correlation:
+    type: value_count
+    rules:
+        - evtxa_failed_dc
+    group-by:
+        - TargetUserName
+    timespan: 30m
+    condition:
+        gte: 5
+        field: Workstation
+level: high
+---
+title: RDP-входы одной учетной записи с разных адресов
+id: 4611191b-4599-58df-bb4c-835ee524ddfe
+status: stable
+description: За час одна учетная запись вошла по RDP с 3 и более разных адресов — общая или скомпрометированная УЗ.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Удаленный доступ
 fstec239: [УПД, ИАФ]
 correlation:
     type: value_count
@@ -4472,638 +6452,229 @@ correlation:
     condition:
         gte: 3
         field: IpAddress
-falsepositives:
-    - Администраторы, работающие с нескольких АРМ
 level: medium
 ---
-title: Использование явных учетных данных для доступа ко многим узлам
-id: f617ab44-e4b7-43d7-a766-9505c0fce031
-status: test
-description: Одна учетная запись за 10 минут использовала явные учетные данные (4648) для пяти и более разных узлов — возможное боковое перемещение или проверка украденных учетных данных.
+title: Kerberoasting — массовый запрос билетов служб с RC4
+id: 23a0908d-c6fd-5e92-a755-7faeffb158f3
+status: stable
+description: За 5 минут одна учетная запись запросила билеты к 5 и более службам с шифрованием RC4.
 author: EVTX Audit
-date: 2026-10-08
+date: 2026-10-14
 tags:
-    - attack.lateral-movement
-    - attack.t1078
-    - attack.t1021
-fstec239: [УПД, ИАФ]
+    - attack.credential-access
+    - attack.t1558.003
+evtxa_group: Признаки атаки
+fstec239: [ИАФ]
 correlation:
     type: value_count
     rules:
-        - evtxa_explicit_credentials
+        - evtxa_kerberos_rc4_tgs
     group-by:
-        - SubjectUserName
-    timespan: 10m
+        - TargetUserName
+    timespan: 5m
     condition:
         gte: 5
-        field: TargetServerName
-falsepositives:
-    - Скрипты администрирования, обходящие серверы
-level: medium
----
-title: Подключение USB-накопителя и установка службы (Kernel-PnP)
-id: 2cf378bb-5876-42aa-95c7-680ae712add9
-status: test
-description: После подключения USB-накопителя в течение 30 минут установлена служба. В изолированном сегменте АСУ ТП это возможный перенос ВПО или неучтенного ПО через съемный носитель.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.initial-access
-    - attack.t1091
-    - attack.persistence
-    - attack.t1543.003
-fstec239: [ЗНИ, ОПС]
-correlation:
-    type: temporal_ordered
-    rules:
-        - evtxa_usb_kernelpnp
-        - evtxa_service_installed
-    timespan: 30m
-falsepositives:
-    - Согласованная установка ПО с носителя
-level: medium
----
-title: Подключение USB-накопителя и установка службы (Partition)
-id: f2c991fa-35f1-4368-8905-0e7dd67d8ec5
-status: test
-description: После подключения диска на шине USB/SD в течение 30 минут установлена служба.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.initial-access
-    - attack.t1091
-    - attack.persistence
-    - attack.t1543.003
-fstec239: [ЗНИ, ОПС]
-correlation:
-    type: temporal_ordered
-    rules:
-        - evtxa_usb_partition
-        - evtxa_service_installed
-    timespan: 30m
-falsepositives:
-    - Согласованная установка ПО с носителя
-level: medium
----
-title: Подключение USB-накопителя и установка службы (Security 6416)
-id: ddeaf5b5-43d3-4aa7-a7b2-9ab3bf53ac27
-status: test
-description: После распознавания внешнего запоминающего устройства в течение 30 минут установлена служба.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.initial-access
-    - attack.t1091
-    - attack.persistence
-    - attack.t1543.003
-fstec239: [ЗНИ, ОПС]
-correlation:
-    type: temporal_ordered
-    rules:
-        - evtxa_usb_security
-        - evtxa_service_installed
-    timespan: 30m
-falsepositives:
-    - Согласованная установка ПО с носителя
-level: medium
----
-title: Изменение времени и очистка журнала
-id: 30185600-5c61-4425-9dc9-9eeb6f75e95a
-status: test
-description: Пользователь изменил системное время, и в пределах часа очищен журнал Security — сокрытие и искажение хронологии событий.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.defense-evasion
-    - attack.t1070.006
-    - attack.t1070.001
-fstec239: [АУД]
-correlation:
-    type: temporal
-    rules:
-        - evtxa_time_changed_by_user
-        - evtxa_security_log_cleared
-    timespan: 1h
-falsepositives:
-    - Ручная коррекция времени при обслуживании с очисткой журнала (должна быть согласована)
+        field: ServiceName
 level: high
 ---
-title: Изменение политики аудита и последующее закрепление в той же сессии
-id: 033b5aaf-e909-4f27-ba64-b2d79f826dbf
-status: test
-description: Сессия, изменившая политику аудита, в течение часа установила службу, создала задание или учетную запись (один SubjectLogonId).
+title: Повторное обнаружение вредоносного ПО на компьютере
+id: 0cc04ff0-69d5-5738-b7da-aca1375e3fa4
+status: stable
+description: За час антивирус обнаружил угрозы 3 и более раз — заражение не устранено или носитель подключается повторно.
 author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.defense-evasion
-    - attack.t1562.002
-    - attack.persistence
-fstec239: [АУД, УПД]
-correlation:
-    type: temporal_ordered
-    rules:
-        - evtxa_audit_policy_changed
-        - evtxa_persistence_security
-    group-by:
-        - SubjectLogonId
-    timespan: 1h
-falsepositives:
-    - Ввод в эксплуатацию с настройкой аудита и учетных записей одним администратором
-level: high
----
-title: Массовое создание учетных записей
-id: 29c27c7a-f498-40d0-8891-b3bb7fd90a83
-status: test
-description: Три и более учетных записи созданы на одном компьютере за час.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.persistence
-    - attack.t1136
-fstec239: [УПД]
+date: 2026-10-14
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
 correlation:
     type: event_count
     rules:
-        - evtxa_account_created
+        - evtxa_av_detection
     timespan: 1h
     condition:
         gte: 3
-falsepositives:
-    - Плановое заведение пользователей
-level: medium
----
-title: Массовое удаление учетных записей
-id: da39fbf0-e57d-487d-bc18-0ccc666f7ea0
-status: test
-description: Три и более учетных записи удалены на одном компьютере за час — возможное нарушение доступности (лишение операторов доступа) или сокрытие следов.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.impact
-    - attack.t1531
-fstec239: [УПД, ОДТ]
-correlation:
-    type: event_count
-    rules:
-        - evtxa_account_deleted
-    timespan: 1h
-    condition:
-        gte: 3
-falsepositives:
-    - Плановая чистка учетных записей
-level: medium
----
-title: Массовое отключение учетных записей
-id: a56213fd-9ebd-4ba3-9cbb-9d93be50e146
-status: test
-description: Три и более учетных записи отключены на одном компьютере за час — возможное лишение доступа (воздействие на доступность).
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.impact
-    - attack.t1531
-fstec239: [УПД, ОДТ]
-correlation:
-    type: event_count
-    rules:
-        - evtxa_account_disabled
-    timespan: 1h
-    condition:
-        gte: 3
-falsepositives:
-    - Плановое отключение учетных записей уволенных сотрудников
-level: medium
----
-title: Массовая установка служб
-id: a8b026fa-e254-43cc-b278-fa3a4c44f3b6
-status: test
-description: Три и более службы установлены на одном компьютере за 10 минут — средства удаленного выполнения (PsExec и аналоги) или установка ПО.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.execution
-    - attack.t1569.002
-fstec239: [ОПС]
-correlation:
-    type: event_count
-    rules:
-        - evtxa_service_installed
-    timespan: 10m
-    condition:
-        gte: 3
-falsepositives:
-    - Установка или обновление прикладного ПО
-level: medium
----
-title: Overpass-the-Hash / Pass-the-Hash (вход типа 9 через seclogo)
-id: 0a5b8772-4a87-4507-9788-7514169a326d
-status: test
-description: Вход с новыми учетными данными (тип 9) процессом seclogo с пакетом Negotiate. Так выглядит запуск процесса с подставленным хешем пароля (утилиты Pass-the-Hash) и runas /netonly.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.lateral-movement
-    - attack.t1550.002
-fstec239: [ИАФ, УПД]
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 4624
-        LogonType: 9
-        LogonProcessName: 'seclogo'
-        AuthenticationPackageName: 'Negotiate'
-    condition: selection
-falsepositives:
-    - Легитимное использование runas /netonly администраторами
 level: high
----
-title: Создана скрытая учетная запись (имя оканчивается на $)
-id: ce5212e2-c71d-4d0d-861a-8ab6730d2ce3
-status: test
-description: Имя новой учетной записи оканчивается символом $, как у учетных записей компьютеров; такие записи не видны в части оснасток.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.persistence
-    - attack.t1136.001
-    - attack.defense-evasion
-    - attack.t1564.002
-fstec239: [УПД]
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 4720
-        TargetUserName|endswith: '$'
-    condition: selection
-falsepositives:
-    - Не ожидаются для локальных учетных записей
-level: high
----
-title: Включена учетная запись Гость
-id: 624385f4-2e68-4240-a1c1-1855b2db2796
-status: test
-description: Включена встроенная учетная запись Гость (RID 501).
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.persistence
-    - attack.t1078.001
-fstec239: [УПД, ИАФ]
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 4722
-        TargetSid|endswith: '-501'
-    condition: selection
-falsepositives:
-    - Не ожидаются
-level: high
----
-title: Включена встроенная учетная запись Администратор
-id: b9c8e0c7-7489-401e-a1d1-dcad56ce3eae
-status: test
-description: Включена встроенная учетная запись Администратор (RID 500). Использование общей встроенной учетной записи затрудняет персонификацию действий.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.persistence
-    - attack.t1078.001
-fstec239: [УПД, ИАФ]
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 4722
-        TargetSid|endswith: '-500'
-    condition: selection
-falsepositives:
-    - Согласованное аварийное использование встроенной учетной записи
-level: medium
----
-title: Сброшен пароль встроенной учетной записи Администратор
-id: 4c9edb96-2d0b-435b-9bad-834703821f89
-status: test
-description: Другой учетной записью сброшен пароль встроенного Администратора (RID 500).
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.persistence
-    - attack.t1098
-fstec239: [УПД, ИАФ]
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 4724
-        TargetSid|endswith: '-500'
-    condition: selection
-falsepositives:
-    - Плановая смена пароля встроенной учетной записи (LAPS и аналоги)
-level: medium
----
-title: RDP-вход под встроенной учетной записью Администратор
-id: 7a98f69c-0f6a-48a5-80ff-55f0e287eb60
-status: test
-description: Удаленный вход (тип 10) под встроенной учетной записью Администратор (RID 500) — действия не персонифицированы.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.lateral-movement
-    - attack.t1021.001
-    - attack.t1078.001
-fstec239: [УПД, ИАФ]
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 4624
-        LogonType: 10
-        TargetUserSid|endswith: '-500'
-    condition: selection
-falsepositives:
-    - Согласованное аварийное администрирование
-level: medium
----
-title: Установлено средство удаленного доступа (служба)
-id: 7a3b74ff-f608-419a-b91c-9963f66b78f3
-status: test
-description: Установлена служба средства удаленного доступа (TeamViewer, AnyDesk, Radmin, RMS, VNC, LiteManager, Ammyy, RustDesk и др.). В сегменте АСУ ТП это неконтролируемый канал удаленного доступа, если он не согласован.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.command-and-control
-    - attack.t1219
-fstec239: [УПД, ОПС]
-logsource:
-    product: windows
-    service: system
-detection:
-    selection:
-        Provider_Name: 'Service Control Manager'
-        EventID: 7045
-    selection_tool:
-        - ServiceName|contains:
-              - 'TeamViewer'
-              - 'AnyDesk'
-              - 'Radmin'
-              - 'RManService'
-              - 'LiteManager'
-              - 'ROMServer'
-              - 'Ammyy'
-              - 'AeroAdmin'
-              - 'Splashtop'
-              - 'ScreenConnect'
-              - 'RustDesk'
-              - 'DWAgent'
-              - 'NetSupport'
-              - 'DameWare'
-              - 'Mesh Agent'
-              - 'AteraAgent'
-              - 'TightVNC'
-              - 'UltraVNC'
-              - 'uvnc_service'
-              - 'RealVNC'
-              - 'VNC Server'
-              - 'Chrome Remote Desktop'
-              - 'LogMeIn'
-              - 'GoToAssist'
-              - 'Getscreen'
-              - 'AnyViewer'
-              - 'ToDesk'
-              - 'Supremo'
-              - 'NoMachine'
-              - 'Remote Utilities'
-        - ImagePath|contains:
-              - 'TeamViewer'
-              - 'AnyDesk'
-              - 'rserver3'
-              - 'rutserv'
-              - 'rfusclient'
-              - 'LiteManager'
-              - 'ROMServer'
-              - 'Ammyy'
-              - 'AeroAdmin'
-              - 'Splashtop'
-              - 'ScreenConnect'
-              - 'rustdesk'
-              - 'dwagent'
-              - 'client32.exe'
-              - 'DWRCS'
-              - 'MeshAgent'
-              - 'AteraAgent'
-              - 'tvnserver'
-              - 'winvnc'
-              - 'vncserver'
-              - 'remoting_host'
-              - 'LogMeIn'
-              - 'g2ax_'
-              - 'getscreen'
-              - 'AnyViewer'
-              - 'ToDesk'
-              - 'Supremo'
-              - 'nxservice'
-    condition: selection and selection_tool
-falsepositives:
-    - Согласованное средство удаленного обслуживания поставщика (должно быть учтено и контролироваться)
-level: high
----
-title: Установлено средство удаленного доступа (служба, Security 4697)
-id: f2241285-3566-4689-96f8-268c43c583ab
-status: test
-description: Установлена служба средства удаленного доступа (по журналу Security 4697).
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.command-and-control
-    - attack.t1219
-fstec239: [УПД, ОПС]
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 4697
-    selection_tool:
-        - ServiceName|contains:
-              - 'TeamViewer'
-              - 'AnyDesk'
-              - 'Radmin'
-              - 'RManService'
-              - 'LiteManager'
-              - 'ROMServer'
-              - 'Ammyy'
-              - 'AeroAdmin'
-              - 'Splashtop'
-              - 'ScreenConnect'
-              - 'RustDesk'
-              - 'DWAgent'
-              - 'NetSupport'
-              - 'DameWare'
-              - 'Mesh Agent'
-              - 'AteraAgent'
-              - 'TightVNC'
-              - 'UltraVNC'
-              - 'uvnc_service'
-              - 'RealVNC'
-              - 'VNC Server'
-              - 'Chrome Remote Desktop'
-              - 'LogMeIn'
-              - 'NoMachine'
-              - 'Remote Utilities'
-        - ServiceFileName|contains:
-              - 'TeamViewer'
-              - 'AnyDesk'
-              - 'rserver3'
-              - 'rutserv'
-              - 'rfusclient'
-              - 'LiteManager'
-              - 'ROMServer'
-              - 'Ammyy'
-              - 'AeroAdmin'
-              - 'Splashtop'
-              - 'ScreenConnect'
-              - 'rustdesk'
-              - 'dwagent'
-              - 'client32.exe'
-              - 'DWRCS'
-              - 'MeshAgent'
-              - 'AteraAgent'
-              - 'tvnserver'
-              - 'winvnc'
-              - 'vncserver'
-              - 'remoting_host'
-              - 'nxservice'
-    condition: selection and selection_tool
-falsepositives:
-    - Согласованное средство удаленного обслуживания поставщика (должно быть учтено и контролироваться)
-level: high
----
-title: Установлено средство удаленного доступа (Windows Installer)
-id: 127b5ddf-d720-419b-8085-d3d3ce86bc78
-status: test
-description: Через Windows Installer (MsiInstaller 1033) установлен продукт удаленного доступа.
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.command-and-control
-    - attack.t1219
-fstec239: [УПД, ОПС]
-logsource:
-    product: windows
-    service: application
-detection:
-    selection:
-        Provider_Name: 'MsiInstaller'
-        EventID: 1033
-    keywords:
-        - 'TeamViewer'
-        - 'AnyDesk'
-        - 'Radmin'
-        - 'Remote Manipulator'
-        - 'Remote Utilities'
-        - 'LiteManager'
-        - 'Ammyy'
-        - 'AeroAdmin'
-        - 'Splashtop'
-        - 'ScreenConnect'
-        - 'RustDesk'
-        - 'NetSupport'
-        - 'DameWare'
-        - 'TightVNC'
-        - 'UltraVNC'
-        - 'RealVNC'
-        - 'Chrome Remote Desktop'
-        - 'LogMeIn'
-        - 'NoMachine'
-        - 'AnyViewer'
-        - 'Getscreen'
-    condition: selection and keywords
-falsepositives:
-    - Согласованное средство удаленного обслуживания поставщика (должно быть учтено и контролироваться)
-level: high
----
-title: Попытка подключения запрещенного устройства
-id: 2a70fd04-4e5a-422e-aedc-f4d2e27a719a
-status: test
-description: Установка устройства запрещена групповой политикой (Security 6423). Кто-то пытался подключить запрещенное устройство (обычно съемный носитель).
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.initial-access
-    - attack.t1091
-fstec239: [ЗНИ]
-logsource:
-    product: windows
-    service: security
-detection:
-    selection:
-        EventID: 6423
-    condition: selection
-falsepositives:
-    - Подключение личных устройств без злого умысла (нарушение политики все равно фиксируется)
-level: medium
----
-title: Подключен съемный носитель (USB/WPD)
-id: 5f9b2c30-3f6f-4557-9b57-0ac90c709ce0
-status: test
-description: Подключено запоминающее устройство USB или устройство WPD (телефон, плеер) — Kernel-PnP/Configuration 400/410. Сведения для контроля подключения машинных носителей; перечень устройств — на листе «Съемные_носители».
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.initial-access
-    - attack.t1091
-fstec239: [ЗНИ]
-logsource:
-    product: windows
-    service: kernel-pnp-configuration
-detection:
-    selection:
-        EventID:
-            - 400
-            - 410
-        DeviceInstanceId|startswith:
-            - 'USBSTOR\'
-            - 'SWD\WPDBUSENUM\'
-    condition: selection
-falsepositives:
-    - Учтенные носители, разрешенные регламентом
-level: low
----
-title: Подключен съемный носитель (диск USB/SD)
-id: cd584316-249c-4cc2-8153-5573df3f4ed8
-status: test
-description: Подключен диск на шине USB, SD или MMC (Partition/Diagnostic 1006): производитель, модель и серийный номер — на листе «Съемные_носители».
-author: EVTX Audit
-date: 2026-10-08
-tags:
-    - attack.initial-access
-    - attack.t1091
-fstec239: [ЗНИ]
-logsource:
-    product: windows
-    service: partition-diagnostic
-detection:
-    selection:
-        EventID: 1006
-        BusType:
-            - 7
-            - 12
-            - 13
-    condition: selection
-falsepositives:
-    - Учтенные носители, разрешенные регламентом
-level: low
 '@
-$script:Engine=$null; $script:EngineType=$null; $script:EngineNote=''; $script:Sigma=$null; $script:SigmaAlertCount=0; $script:SigmaProblemsLogged=0
+$script:SigmaPackProcess=@'
+# Правила запуска процессов (Security 4688 с командной строкой или Sysmon 1).
+# Подключаются только с -IncludeProcessCreation: требуют чтения всех событий запуска процессов.
+title: Пользователь запустил командную строку или PowerShell
+id: c680a69e-e1c1-5400-b849-57997322bbe9
+status: stable
+description: Интерактивный пользователь запустил cmd, PowerShell или PowerShell ISE. Операторам АСУ ТП командная оболочка обычно не нужна.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Запуск программ
+fstec239: [ОПС]
+fields:
+    - Программа=Image
+    - Команда=CommandLine
+    - Родитель=ParentImage
+    - Пользователь=User
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        Image|endswith:
+            - '\cmd.exe'
+            - '\powershell.exe'
+            - '\pwsh.exe'
+            - '\powershell_ise.exe'
+        ParentImage|endswith: '\explorer.exe'
+    condition: selection
+level: medium
+---
+title: Запущена программа из папки пользователя (Загрузки, Рабочий стол, Temp)
+id: 51b57fe7-b2af-5be5-aab7-883ce0b6d2b2
+status: stable
+description: Исполняемый файл запущен из папки, куда пользователь сам копирует файлы, — признак запуска постороннего ПО.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Запуск программ
+fstec239: [ОПС]
+fields:
+    - Программа=Image
+    - Команда=CommandLine
+    - Пользователь=User
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        Image|contains:
+            - '\Downloads\'
+            - '\Загрузки\'
+            - '\Desktop\'
+            - '\Рабочий стол\'
+            - '\AppData\Local\Temp\'
+            - '\Users\Public\'
+    condition: selection
+level: high
+---
+title: Запущен браузер, мессенджер или игра
+id: 2f2ba146-33fc-50e6-bb94-ee85671a831c
+status: stable
+description: Запущено ПО, не относящееся к технологическому процессу.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Запуск программ
+fstec239: [ОПС]
+fields:
+    - Программа=Image
+    - Пользователь=User
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        Image|endswith:
+            - '\chrome.exe'
+            - '\msedge.exe'
+            - '\firefox.exe'
+            - '\opera.exe'
+            - '\browser.exe'
+            - '\Telegram.exe'
+            - '\WhatsApp.exe'
+            - '\Viber.exe'
+            - '\Skype.exe'
+            - '\Discord.exe'
+            - '\steam.exe'
+            - '\sol.exe'
+            - '\spider.exe'
+            - '\freecell.exe'
+            - '\Minesweeper.exe'
+            - '\winmine.exe'
+            - '\MicrosoftSolitaire.exe'
+    condition: selection
+level: medium
+---
+title: Запущено средство удаленного доступа
+id: 2ab89192-1e3b-5359-9cd8-b2555101821f
+status: stable
+description: Запущен клиент удаленного доступа (TeamViewer, AnyDesk, RMS, Radmin, VNC и т.п.).
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Удаленный доступ
+fstec239: [УПД, ОПС]
+fields:
+    - Программа=Image
+    - Пользователь=User
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        Image|contains:
+            - 'TeamViewer'
+            - 'AnyDesk'
+            - 'rserver3'
+            - 'rutserv'
+            - 'rfusclient'
+            - 'LiteManager'
+            - 'ROMServer'
+            - 'ROMViewer'
+            - 'Ammyy'
+            - 'AeroAdmin'
+            - 'Splashtop'
+            - 'ScreenConnect'
+            - 'rustdesk'
+            - 'rudesktop'
+            - 'dwagent'
+            - 'client32.exe'
+            - 'DWRCS'
+            - 'MeshAgent'
+            - 'AteraAgent'
+            - 'tvnserver'
+            - 'winvnc'
+            - 'vncserver'
+            - 'vncviewer'
+            - 'remoting_host'
+            - 'LogMeIn'
+            - 'g2ax_'
+            - 'getscreen'
+            - 'AnyViewer'
+            - 'ToDesk'
+            - 'Supremo'
+            - 'nxservice'
+            - 'nxplayer'
+    condition: selection
+level: high
+---
+title: Пользователь запустил средство администрирования
+id: 6aa7743b-e291-5e76-8122-d7f4ab4bcd7e
+status: stable
+description: Запущены редактор реестра, редактор групповой политики, консоль служб, диспетчер задач или аналогичные средства.
+author: EVTX Audit
+date: 2026-10-14
+evtxa_group: Запуск программ
+fstec239: [ОПС, УПД]
+fields:
+    - Программа=Image
+    - Команда=CommandLine
+    - Пользователь=User
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection_image:
+        Image|endswith:
+            - '\regedit.exe'
+            - '\taskmgr.exe'
+            - '\gpedit.msc'
+            - '\secpol.msc'
+    selection_mmc:
+        Image|endswith: '\mmc.exe'
+        CommandLine|contains:
+            - 'services.msc'
+            - 'gpedit.msc'
+            - 'secpol.msc'
+            - 'compmgmt.msc'
+            - 'lusrmgr.msc'
+            - 'devmgmt.msc'
+    condition: 1 of selection_*
+level: medium
+'@
+$script:Engine=$null; $script:EngineType=$null; $script:EngineNote=''; $script:Sigma=$null; $script:SigmaAlertCount=0; $script:SigmaProblemsLogged=0; $script:ViolationCount=0
 function Get-EngineType {
     if ($script:EngineType) { return $script:EngineType }
     $ns='EvtxAudit_'+(Hash-Text $script:EngineSource).Substring(0,16)
@@ -5159,7 +6730,10 @@ function New-SigmaEngine([string[]]$ExtraPaths) {
     $type=Get-EngineType
     $sigma=New-Object ($type.Namespace+'.SigmaEngine')
     $sigma.PriorityHigh=$script:P1; $sigma.PriorityMedium=$script:P2; $sigma.PriorityLow=$script:P3
+    $sigma.DisplayZone=$script:DisplayTz
     [void]$sigma.LoadText($script:SigmaPack,'Встроенный пакет EVTX Audit')
+    # Process rules need every process start (4688 / Sysmon 1): only with -IncludeProcessCreation.
+    if ($IncludeProcessCreation) { [void]$sigma.LoadText($script:SigmaPackProcess,'Встроенный пакет EVTX Audit: запуск процессов') }
     # A missing or unreadable rule path is reported; the embedded pack is still used.
     foreach ($path in @($ExtraPaths | Where-Object { $_ })) {
         try {
@@ -5279,7 +6853,8 @@ function New-RunSummaryCsv([string]$WorkPath) {
             [pscustomobject]@{Label='Правил Sigma загружено';Value=$run.SigmaRules},
             [pscustomobject]@{Label='Корреляций Sigma';Value=$run.SigmaCorrelations},
             [pscustomobject]@{Label='Правил Sigma пропущено (неподдерживаемые)';Value=$run.SigmaSkipped},
-            [pscustomobject]@{Label='Срабатываний Sigma';Value=$run.SigmaAlerts},
+            [pscustomobject]@{Label='Нарушений (строк листа Нарушения)';Value=$run.Violations},
+            [pscustomobject]@{Label='Цепочек и сводных срабатываний Sigma';Value=$run.SigmaAlerts},
             [pscustomobject]@{Label='Дополнительные правила Sigma';Value=$run.Parameters.SigmaRulesPath},
             [pscustomobject]@{Label='Файлов обнаружено';Value=$run.FilesDiscovered},
             [pscustomobject]@{Label='Файлов обработано';Value=$run.FilesProcessed},
@@ -5307,7 +6882,8 @@ function New-RunSummaryCsv([string]$WorkPath) {
             [pscustomobject]@{Label='Окно цепочек, мин';Value=$run.Parameters.TriageWindowMinutes},
             [pscustomobject]@{Label='Объединение в КИ, ч';Value=$run.Parameters.IncidentGapHours},
             [pscustomobject]@{Label='NoSigma';Value=$run.Parameters.NoSigma},
-            [pscustomobject]@{Label='NoCompiledEngine';Value=$run.Parameters.NoCompiledEngine}
+            [pscustomobject]@{Label='NoCompiledEngine';Value=$run.Parameters.NoCompiledEngine},
+            [pscustomobject]@{Label='AttackTriage';Value=$run.Parameters.AttackTriage}
         )
         foreach ($pair in $pairs) { Write-Row $w @($pair.Label,$pair.Value) }
     } finally { Close-Writer $w }
@@ -5318,16 +6894,17 @@ function New-RunSummaryCsv([string]$WorkPath) {
 $script:NumericHeaders=[Collections.Generic.HashSet[string]]::new([string[]]@('Оценка риска','Связанных уникальных событий','Сценариев','Количество','Событий в окне','Разных УЗ',
     'Сеансов (пар)','Суммарная длительность, сек','Длительность, сек','Номер','Находок','Прочитано подходящих событий','Ошибок разбора','Нет описания Windows','Размер, байт','Время обработки, сек',
     'КИ P1','КИ P2','Срабатываний Sigma','Правил Sigma','Успешных входов','Неудачных входов','RDP-сеансов','Съемных носителей','Изменений ПО','Изменений УЗ','Очисток журналов','Аварийных перезагрузок',
-    'Глубина Security, дней','Событий','Компьютеров','Подключений (оценка)','Емкость, ГБ'))
+    'Глубина Security, дней','Событий','Компьютеров','Подключений (оценка)','Емкость, ГБ',
+    'Нарушений всего','Критических и высоких','Средних','Низких','Цепочек','Повторов'))
 $script:WideHeaders=[Collections.Generic.HashSet[string]]::new([string[]]@('Хронология','Основание связи','Почему выделено','Что проверить','УЗ / объект / IP','Ссылки на находки и EVTX (до 10)',
     'Комментарий','Что это означает / что запросить','Что делать','Ограничения','Ошибка','Этапы (тактики)','Данные события','Описание Windows','Командная строка',
-    'Цепочка событий','Ссылки на события','Описание','Ложные срабатывания','Главные сценарии','Замечания','Путь / параметры','Изменение / детали','Риск / примечание'))
+    'Цепочка событий','Ссылки на события','Описание','Ложные срабатывания','Главные сценарии','Замечания','Путь / параметры','Изменение / детали','Риск / примечание',
+    'Детали','Нарушение','Ход событий','Основные нарушения','Возможные причины'))
 $script:MediumHeaders=[Collections.Generic.HashSet[string]]::new([string[]]@('Сценарий','Тактика','MITRE ATT&CK','Учетные записи','IP источника','IP источников','Компьютер','Событие','Категория',
     'Цепочка атаки','Инициатор','Целевая УЗ','Учетная запись','Файл источника','Папка источника','Полный путь','Процесс','Имя угрозы','Ресурс / путь',
     'Правило','Группировка','Устройство','Продукт / служба / обновление','Меры ФСТЭК №239 (группы)','Внешние IP (успешные входы, RDP)','Средства удаленного доступа','Компьютеры',
     'Вероятные пользователи','Вероятный пользователь (активный вход)','Журналы (каналы)','Папки источника','Источник (IP / станция)','Расшифровка кодов',
-    'Описание типа','Идентификатор устройства','Действие','Примечание','Группа','Источник правила'))
-$script:HiddenFindingHeaders=[Collections.Generic.HashSet[string]]::new([string[]]@('Папка источника','Полный путь','Канал','Уровень Windows','Статус описания','SHA256 XML события','Восстановление XML','Правило'))
+    'Описание типа','Идентификатор устройства','Действие','Примечание','Группа','Источник правила','Пользователь','Цепочка','Файл','Журнал'))
 function Read-CsvHeader([string]$Path) {
     # FileShare.ReadWrite: Errors.csv and other reports may still be open for writing
     # (Windows refuses a plain read of such a file; SelfTest reads the plan this way).
@@ -5338,45 +6915,54 @@ function Read-CsvHeader([string]$Path) {
     $quote='"'
     return @($line.Trim().Trim($quote) -split [regex]::Escape($quote+[string]$Delimiter+$quote))
 }
+# Columns of the findings shown in Excel; the CSV keeps all of them for the analysis.
+$script:FindingsExcelColumns=[Collections.Generic.HashSet[string]]::new([string[]]@('Номер','Event ID','Record ID','Приоритет','Категория','Событие','Время UTC','Компьютер',
+    'Файл журнала','Результат аудита','Инициатор','Целевая УЗ','IP источника','Рабочая станция','Тип входа','Процесс','Данные события','Описание Windows'))
+# Violation groups: report order of the summary columns.
+$script:ViolationGroups=@('Изменение времени','Учетные записи','Права и группы','Входы в систему','Удаленный доступ','Съемные носители','Установка ПО и служб',
+    'Запуск программ','Средства защиты','Журналы и аудит','Сеть и периферия','Перезагрузки и сбои','Признаки атаки','Прочее')
 function Get-ExcelSheetPlan([string]$WorkPath) {
     $plan=New-Object 'System.Collections.Generic.List[object]'
+    # Kind: Level (rows colored by «Уровень»), Priority (by «Приоритет» P1/P2), Severity, Findings, Summary, Plain.
     # Freeze: columns kept visible when scrolling right (-1 = by kind).
     $add={ param([string]$Name,[string]$Path,[string]$Kind,[int]$Freeze=-1)
         if (-not (Test-Path -LiteralPath $Path)) { return }
         $headers=@(Read-CsvHeader $Path)
+        # Types cover every CSV column (9 = skipped on import); the other lists use shown columns.
         $types=New-Object 'System.Collections.Generic.List[int]'; $widths=New-Object 'System.Collections.Generic.List[double]'
         $wrap=New-Object 'System.Collections.Generic.List[int]'; $hidden=New-Object 'System.Collections.Generic.List[int]'
+        $shown=New-Object 'System.Collections.Generic.List[string]'
         $priority=0
         for ($c=0; $c -lt $headers.Count; $c++) {
             $h=$headers[$c]
-            if ($script:NumericHeaders.Contains($h)) { $types.Add(1) } else { $types.Add(2) }
-            if ($script:WideHeaders.Contains($h)) { $widths.Add(60); $wrap.Add($c+1) } elseif ($script:MediumHeaders.Contains($h)) { $widths.Add(30) } else { $widths.Add(0) }
-            if ($Kind -eq 'Findings' -and ($script:HiddenFindingHeaders.Contains($h) -or ($h -eq 'Описание Windows' -and -not $script:FormatMessages))) { $hidden.Add($c+1) }
-            if ($h -eq 'Приоритет' -and $priority -eq 0) { $priority=$c+1 }
+            if ($Kind -eq 'Findings' -and (-not $script:FindingsExcelColumns.Contains($h) -or ($h -eq 'Описание Windows' -and -not $script:FormatMessages))) { $types.Add(9); continue }
+            $shown.Add($h); $n=$shown.Count
+            if ($script:NumericHeaders.Contains($h) -or ($Kind -eq 'Summary' -and $h -in $script:ViolationGroups)) { $types.Add(1) } else { $types.Add(2) }
+            if ($script:WideHeaders.Contains($h)) { $widths.Add(60); $wrap.Add($n) } elseif ($script:MediumHeaders.Contains($h)) { $widths.Add(30) } else { $widths.Add(0) }
+            if ($Kind -eq 'Level' -and $h -eq 'ID правил') { $hidden.Add($n) }
+            if ($priority -eq 0 -and (($Kind -ne 'Level' -and $h -eq 'Приоритет') -or ($Kind -eq 'Level' -and $h -eq 'Уровень'))) { $priority=$n }
         }
         if ($Freeze -lt 0) { $Freeze=0; if ($Kind -eq 'Priority') { $Freeze=3 } }
-        $plan.Add([pscustomobject]@{Name=$Name;Path=$Path;Kind=$Kind;Headers=$headers;Types=$types.ToArray();Widths=$widths.ToArray();Wrap=$wrap.ToArray();Hidden=$hidden.ToArray();PriorityColumn=$priority;Freeze=$Freeze})
+        $plan.Add([pscustomobject]@{Name=$Name;Path=$Path;Kind=$Kind;Headers=$shown.ToArray();Types=$types.ToArray();Widths=$widths.ToArray();Wrap=$wrap.ToArray();Hidden=$hidden.ToArray();PriorityColumn=$priority;Freeze=$Freeze})
     }
-    & $add 'Хосты' (Join-Path $WorkPath 'Hosts.csv') 'Priority' 1
+    & $add 'Сводка' (Join-Path $WorkPath 'Hosts.csv') 'Summary' 1
+    & $add 'Нарушения' (Join-Path $WorkPath 'Violations.csv') 'Level' 2
+    & $add 'Цепочки' (Join-Path $WorkPath 'Chains.csv') 'Level' 2
+    & $add 'Правила' (Join-Path $WorkPath 'SigmaRules.csv') 'Level' 3
+    # Attack triage sheets exist only with -AttackTriage.
     & $add 'Инциденты' (Join-Path $WorkPath 'Incidents.csv') 'Priority'
     & $add 'Приоритетные' (Join-Path $WorkPath 'Triage.csv') 'Priority'
-    & $add 'Sigma' (Join-Path $WorkPath 'SigmaAlerts.csv') 'Priority' 5
     & $add 'Подбор_пароля' (Join-Path $WorkPath 'AuthBursts.csv') 'Severity'
     & $add 'Входы' (Join-Path $WorkPath 'LogonSummary.csv') 'Plain' 3
-    & $add 'RDP_итоги' (Join-Path $WorkPath 'RdpTotals.csv') 'Plain'
     & $add 'RDP_сеансы' (Join-Path $WorkPath 'RdpIntervals.csv') 'Plain'
     & $add 'Съемные_носители' (Join-Path $WorkPath 'UsbDevices.csv') 'Plain' 2
-    & $add 'Носители_события' (Join-Path $WorkPath 'UsbEvents.csv') 'Plain' 3
-    & $add 'Изменения_ПО' (Join-Path $WorkPath 'SoftwareChanges.csv') 'Plain' 3
-    & $add 'Учетные_записи' (Join-Path $WorkPath 'AccountChanges.csv') 'Plain' 3
     $parts=@(Get-ChildItem -LiteralPath $WorkPath -Filter 'Findings-*.csv' -File | Sort-Object Name)
     for ($i=0; $i -lt $parts.Count; $i++) {
         $name='Находки'; if ($parts.Count -gt 1) { $name='Находки_'+($i+1) }
         & $add $name $parts[$i].FullName 'Findings'
     }
-    & $add 'Сводка' (Join-Path $WorkPath 'Summary.csv') 'Severity'
-    & $add 'Файлы' (Join-Path $WorkPath 'Files.csv') 'Plain'
     & $add 'Качество_выгрузки' (Join-Path $WorkPath 'Coverage.csv') 'Plain'
+    & $add 'Файлы' (Join-Path $WorkPath 'Files.csv') 'Plain'
     & $add 'Ошибки' (Join-Path $WorkPath 'Errors.csv') 'Plain'
     $runSummary=New-RunSummaryCsv $WorkPath
     if ($runSummary) { & $add 'Запуск' $runSummary 'Plain' }
@@ -5391,7 +6977,13 @@ function Add-ExcelPriorityColors($Sheet,$Item,[int]$Rows,[int]$Columns) {
     # Excel colors are BGR integers. Light red / light amber fills, dark text.
     $missing=[Reflection.Missing]::Value
     $col=Get-ColumnLetter $Item.PriorityColumn
-    if ($Item.Kind -eq 'Priority') {
+    if ($Item.Kind -eq 'Level') {
+        $range=$Sheet.Range(('A2:'+(Get-ColumnLetter $Columns)+$Rows))
+        foreach ($rule in @(@('Критический',9737946,393372),@('Высокий',13551615,393372),@('Средний',10284031,26012))) {
+            $fc=$range.FormatConditions.Add(2,$missing,('=$'+$col+'2="'+$rule[0]+'"'))
+            $fc.Interior.Color=$rule[1]; $fc.Font.Color=$rule[2]
+        }
+    } elseif ($Item.Kind -eq 'Priority') {
         $range=$Sheet.Range(('A2:'+(Get-ColumnLetter $Columns)+$Rows))
         foreach ($rule in @(@($script:P1,13551615,393372),@($script:P2,10284031,26012))) {
             $fc=$range.FormatConditions.Add(2,$missing,('=$'+$col+'2="'+$rule[0]+'"'))
@@ -5468,7 +7060,7 @@ function Export-ReportsToExcel([string]$WorkPath,[string]$XlsxPath) {
                             elseif ($column.ColumnWidth -gt 40) { $column.ColumnWidth=40 }
                         } catch { }
                     }
-                    if ($item.Kind -eq 'Priority' -and $rowCount -le 5000) {
+                    if ($item.Kind -in @('Priority','Level','Summary') -and $rowCount -le 5000) {
                         foreach ($c in $item.Wrap) { try { $sheet.Columns.Item($c).WrapText=$true } catch { } }
                         try { $used.VerticalAlignment=-4160; [void]$used.Rows.AutoFit() } catch { } # xlTop
                     }
@@ -5476,8 +7068,8 @@ function Export-ReportsToExcel([string]$WorkPath,[string]$XlsxPath) {
                     if ($item.PriorityColumn -gt 0 -and $rowCount -gt 1) { try { Add-ExcelPriorityColors $sheet $item $rowCount $colCount } catch { } }
                 }
                 try {
-                    if ($item.Name -eq 'Инциденты') { $sheet.Tab.Color=255 } elseif ($item.Name -eq 'Приоритетные') { $sheet.Tab.Color=39423 }
-                    elseif ($item.Name -eq 'Хосты') { $sheet.Tab.Color=12611584 } elseif ($item.Name -eq 'Sigma') { $sheet.Tab.Color=10498160 }
+                    if ($item.Name -eq 'Нарушения') { $sheet.Tab.Color=255 } elseif ($item.Name -eq 'Цепочки') { $sheet.Tab.Color=39423 }
+                    elseif ($item.Name -eq 'Сводка') { $sheet.Tab.Color=12611584 } elseif ($item.Name -eq 'Инциденты') { $sheet.Tab.Color=10498160 }
                 } catch { }
                 try {
                     $sheet.Activate()
@@ -5516,7 +7108,7 @@ function New-FallbackOverview([string]$WorkPath,[string]$Destination) {
         $hostPath=Join-Path $WorkPath 'Hosts.csv'
         if (Test-Path -LiteralPath $hostPath) {
             foreach ($r in (Import-Csv -LiteralPath $hostPath -Delimiter $Delimiter -Encoding UTF8)) {
-                Write-Row $w @('Хост','',$r.'Приоритет',('Оценка '+$r.'Оценка риска'+'; КИ P1: '+$r.'КИ P1'+'; P2: '+$r.'КИ P2'+'; Sigma: '+$r.'Срабатываний Sigma'),$r.'Компьютер',$r.'Период событий с (UTC)',$r.'Период событий по (UTC)','',$r.'Внешние IP (успешные входы, RDP)','',$r.'Изменений ПО','',$r.'Папки источника',($r.'Главные сценарии'+' | '+$r.'Замечания'))
+                Write-Row $w @('Хост','','',('Нарушений: '+$r.'Нарушений всего'+'; высоких: '+$r.'Критических и высоких'+'; цепочек: '+$r.'Цепочек'),$r.'Компьютер',$r.'Период событий с (UTC)',$r.'Период событий по (UTC)','','','',$r.'Нарушений всего','','',($r.'Основные нарушения'+' | '+$r.'Замечания'))
             }
         }
         $incidentPath=Join-Path $WorkPath 'Incidents.csv'
@@ -5532,10 +7124,11 @@ function New-FallbackOverview([string]$WorkPath,[string]$Destination) {
                 Write-Row $w @(('Приоритетная находка '+$r.'КИ'),$r.'Event ID',$r.'Приоритет',($r.'Сценарий'+' ['+$r.'Оценка риска'+'; '+$r.'MITRE ATT&CK'+']'),$r.'Компьютер',$r.'Первое время UTC',$r.'Последнее время UTC',$r.'Учетные записи',$r.'IP источника','',$r.'Связанных уникальных событий','Кандидат',$r.'Папка источника',($r.'УЗ / объект / IP'+' | '+$r.'Основание связи'+' '+$r.'Почему выделено'+' '+$r.'Что проверить'+' '+$r.'Ссылки на находки и EVTX (до 10)'+' '+$r.'Ограничения'))
             }
         }
-        $sigmaPath=Join-Path $WorkPath 'SigmaAlerts.csv'
-        if (Test-Path -LiteralPath $sigmaPath) {
-            foreach ($r in (Import-Csv -LiteralPath $sigmaPath -Delimiter $Delimiter -Encoding UTF8)) {
-                Write-Row $w @('Sigma',$r.'Event ID',$r.'Приоритет',($r.'Правило'+' ['+$r.'Оценка риска'+'; '+$r.'MITRE ATT&CK'+']'),$r.'Компьютер',$r.'Первое время UTC',$r.'Последнее время UTC',$r.'Учетные записи',$r.'IP источника','',$r.'Событий',$r.'Тип',$r.'Папка источника',($r.'Цепочка событий'+' | '+$r.'Ссылки на события'))
+        $chainPath=Join-Path $WorkPath 'Chains.csv'
+        if (Test-Path -LiteralPath $chainPath) {
+            foreach ($r in (Import-Csv -LiteralPath $chainPath -Delimiter $Delimiter -Encoding UTF8)) {
+                if (-not $r.'Компьютер') { continue }
+                Write-Row $w @('Цепочка','',$r.'Уровень',$r.'Цепочка',$r.'Компьютер',$r.'Начало UTC',$r.'Конец UTC',$r.'Учетные записи',$r.'IP источника','',$r.'Событий',$r.'Группа','',($r.'Ход событий'+' | '+$r.'Ссылки на события'))
             }
         }
         $runPath=Join-Path $WorkPath 'Run.json'
@@ -5598,7 +7191,7 @@ function Publish-FinalReports([string]$WorkPath,[string]$OutputRoot,[string]$Bas
             return @($result)
         } catch {
             if (Test-Path -LiteralPath $xlsx) { try { Remove-Item -LiteralPath $xlsx -Force } catch { } }
-            Write-Warning ('Не удалось создать XLSX через установленный Excel: '+$_.Exception.Message+' Будут созданы 2 Excel-совместимых CSV.')
+            Write-Warning ('Не удалось создать XLSX через установленный Excel: '+$_.Exception.Message+' Будут созданы Excel-совместимые CSV.')
         }
     }
     $parts=@(Get-ChildItem -LiteralPath $WorkPath -Filter 'Findings-*.csv' -File | Sort-Object Name)
@@ -5609,6 +7202,12 @@ function Publish-FinalReports([string]$WorkPath,[string]$OutputRoot,[string]$Bas
     }
     $overviewOut=Join-Path $OutputRoot ($BaseName+'_Overview.csv')
     New-FallbackOverview $WorkPath $overviewOut
+    $violations=Join-Path $WorkPath 'Violations.csv'
+    if (Test-Path -LiteralPath $violations) {
+        $violationsOut=Join-Path $OutputRoot ($BaseName+'_Violations.csv')
+        Copy-Item -LiteralPath $violations -Destination $violationsOut -Force
+        $result.Add($violationsOut)
+    }
     $result.Add($findingsOut); $result.Add($overviewOut)
     return @($result)
 }
@@ -6744,78 +8343,6 @@ function Build-UsbSheets([string]$WorkPath,$Rows,$Logons) {
     } finally { Close-Writer $w }
     return $devices
 }
-$script:SoftwareKeys=[Collections.Generic.HashSet[string]]::new([string[]]@('MsiInstaller|1033','MsiInstaller|1034','MsiInstaller|1035','MsiInstaller|1022',
-    'Microsoft-Windows-WindowsUpdateClient|19','Microsoft-Windows-WindowsUpdateClient|20','Service Control Manager|7045','Microsoft-Windows-Security-Auditing|4697'),[StringComparer]::OrdinalIgnoreCase)
-# Remote administration tools; the same list as the Sigma pack rules.
-$script:RemoteToolRx='(?i)(teamviewer|anydesk|radmin|rserver3|rmanservice|rutserv|rfusclient|remote utilities|litemanager|romserver|ammyy|aeroadmin|splashtop|screenconnect|rustdesk|rudesktop|dwagent|dwservice|netsupport|client32\.exe|dameware|dwrcs|mesh ?agent|atera|tightvnc|tvnserver|ultravnc|uvnc_service|winvnc|realvnc|vnc server|vncserver|chrome remote desktop|remoting_host|logmein|gotoassist|g2ax_|getscreen|anyviewer|todesk|supremo|nomachine|nxservice)'
-$script:SignatureUpdateRx='(?i)(KB2267602|KB4052623|KB915597|Security Intelligence Update|Definition Update|обновлени[ея] (аналитики|определений|сигнатур))'
-function Build-SoftwareSheet([string]$WorkPath,$Rows) {
-    $items=New-Object 'System.Collections.Generic.List[object]'; $signatures=@{}; $seen=New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($r in $Rows) {
-        $provider=[string]$r.'Провайдер'; $id=[string]$r.'Event ID'
-        if (-not $script:SoftwareKeys.Contains($provider+'|'+$id)) { continue }
-        $computer=[string]$r.'Компьютер'; $time=[string]$r.'Время UTC'
-        $action=[string]$r.'Событие'; $product=''; $version=''; $vendor=''; $result=''; $details=''
-        $risk=New-Object 'System.Collections.Generic.List[string]'
-        $user=Triage-Value $r 'Инициатор'; if (-not $user) { $user=Triage-Value $r 'SID инициатора' }
-        if ($provider -eq 'MsiInstaller') {
-            # Windows Installer: Data0 product, Data1 version, Data2 language, Data3 status, Data4 manufacturer.
-            $product=Triage-DataValue $r @('Data0')
-            if ($id -eq '1022') { $details=Triage-DataValue $r @('Data1') }
-            else {
-                $version=Triage-DataValue $r @('Data1'); $vendor=Triage-DataValue $r @('Data4')
-                $status=Triage-DataValue $r @('Data3')
-                if ($status -eq '0') { $result='Успешно' } elseif ($status) { $result='Код '+$status }
-            }
-        } elseif ($provider -eq 'Microsoft-Windows-WindowsUpdateClient') {
-            $product=Triage-DataValue $r @('updateTitle')
-            if ($id -eq '20') { $result='Ошибка '+(Triage-DataValue $r @('errorCode')) } else { $result='Успешно' }
-            if ($id -eq '19' -and $product -match $script:SignatureUpdateRx) {
-                # Antivirus signature updates arrive several times a day: one summary row per computer.
-                $k=$computer.ToLowerInvariant(); $s=$signatures[$k]
-                if ($null -eq $s) { $s=[pscustomobject]@{Computer=$computer;Count=0;First=$time;Last=$time;Title=$product;Row=$r}; $signatures[$k]=$s }
-                $s.Count++
-                if ([string]::CompareOrdinal($time,$s.First) -lt 0) { $s.First=$time }
-                if ([string]::CompareOrdinal($time,$s.Last) -gt 0) { $s.Last=$time; $s.Title=$product; $s.Row=$r }
-                continue
-            }
-        } else {
-            $product=Triage-DataValue $r @('ServiceName')
-            $image=Triage-DataValue $r @('ImagePath','ServiceFileName')
-            $details=$image
-            $start=Triage-DataValue $r @('StartType','ServiceStartType'); $account=Triage-DataValue $r @('AccountName','ServiceAccount')
-            if ($start) { $details+=' | запуск: '+$start }
-            if ($account) { $details+=' | УЗ: '+$account }
-            $minute=$time; if ($minute.Length -ge 16) { $minute=$minute.Substring(0,16) }
-            # Security 4697 and System 7045 describe the same installation.
-            if (-not $seen.Add(($computer+'|'+$product+'|'+$minute).ToLowerInvariant())) { continue }
-            if (($product+' '+$image) -match $script:RemoteExecService) { $risk.Add('признак удаленного выполнения (PsExec/Impacket): '+$Matches[0]) }
-            else { $serviceRisk=Get-ServiceRisk $r; if ($serviceRisk.HasRisk) { $risk.Add($serviceRisk.Evidence) } }
-            $result='Установлена'
-        }
-        $tool=''
-        if (($product+' '+$vendor+' '+$details) -match $script:RemoteToolRx) { $tool=$Matches[0]; $risk.Insert(0,'средство удаленного доступа: '+$tool) }
-        $items.Add([pscustomobject]@{Computer=$computer;Tool=$tool;Ticks=(Get-IsoTicks $time);Row=@((Format-UtcText $time),(Format-LocalText $time),$computer,$action,$product,$version,$vendor,$result,
-            $details,$user,($risk.ToArray() -join '; '),$id,$provider,(Triage-Value $r 'Номер'),(Triage-Value $r 'Record ID'),(Triage-Value $r 'Полный путь'),(Triage-Value $r 'Папка источника'))})
-    }
-    foreach ($s in $signatures.Values) {
-        $r=$s.Row
-        $items.Add([pscustomobject]@{Computer=$s.Computer;Tool='';Ticks=(Get-IsoTicks $s.Last);Row=@((Format-UtcText $s.Last),(Format-LocalText $s.Last),$s.Computer,'Обновления сигнатур антивируса (Windows Update)',
-            $s.Title,'','',('Успешно: '+$s.Count),('Сводная строка: первое обновление '+(Format-UtcText $s.First)+' UTC, последнее '+(Format-UtcText $s.Last)+' UTC'),'','','19',
-            'Microsoft-Windows-WindowsUpdateClient',(Triage-Value $r 'Номер'),(Triage-Value $r 'Record ID'),(Triage-Value $r 'Полный путь'),(Triage-Value $r 'Папка источника'))})
-    }
-    $w=New-Writer (Join-Path $WorkPath 'SoftwareChanges.csv')
-    try {
-        Write-Row $w @('Время UTC','Время (местное)','Компьютер','Действие','Продукт / служба / обновление','Версия','Производитель','Результат','Путь / параметры','Инициатор','Риск / примечание','Event ID','Источник','Номер находки','Record ID','Файл источника','Папка источника')
-        foreach ($item in ($items | Sort-Object Computer,Ticks)) { Write-Row $w $item.Row }
-    } finally { Close-Writer $w }
-    return ,$items
-}
-$script:AccountActions=@{'4720'='Создана УЗ';'4722'='Включена УЗ';'4723'='Попытка смены пароля';'4724'='Сброс пароля';'4725'='Отключена УЗ';'4726'='Удалена УЗ';
-    '4738'='Изменена УЗ';'4740'='УЗ заблокирована';'4767'='УЗ разблокирована';'4781'='УЗ переименована';'4741'='Создана УЗ компьютера';'4743'='Удалена УЗ компьютера';
-    '4728'='Добавлен в глобальную группу';'4732'='Добавлен в локальную группу';'4756'='Добавлен в универсальную группу';'4729'='Удален из глобальной группы';
-    '4733'='Удален из локальной группы';'4757'='Удален из универсальной группы';'4765'='Добавлен SID History';'4766'='Отказ в добавлении SID History'}
-$script:AccountChangeFields=@('SamAccountName','DisplayName','UserPrincipalName','HomeDirectory','ScriptPath','ProfilePath','UserWorkstations','AccountExpires','PrimaryGroupId','AllowedToDelegateTo','UserParameters','SidHistory','LogonHours')
 # UserAccountControl of 4720/4738 uses SAM bits (0x15 = disabled + password not required + normal account).
 $script:UacRiskFlags=@(@(0x4,'пароль не обязателен',$true),@(0x200,'срок действия пароля не ограничен',$false),@(0x800,'хранение пароля с обратимым шифрованием',$true),
     @(0x2000,'доверена для делегирования',$true),@(0x8000,'только DES',$true),@(0x10000,'без предварительной аутентификации Kerberos (AS-REP Roasting)',$true),
@@ -6829,63 +8356,66 @@ function Get-UacChange($r,[bool]$StrongOnly) {
     foreach ($f in $script:UacRiskFlags) { if (($added -band $f[0]) -ne 0 -and ($f[2] -or -not $StrongOnly)) { $flags.Add($f[1]) } }
     return ($flags.ToArray() -join ', ')
 }
-function Build-AccountSheet([string]$WorkPath,$Rows) {
-    $items=New-Object 'System.Collections.Generic.List[object]'
-    foreach ($r in $Rows) {
-        if ([string]$r.'Провайдер' -ne 'Microsoft-Windows-Security-Auditing') { continue }
-        $id=[string]$r.'Event ID'
-        $action=$script:AccountActions[$id]
-        if (-not $action) { continue }
-        $target=Triage-Value $r 'Целевая УЗ'; $targetSid=Triage-Value $r 'SID целевой УЗ'; $group=''; $groupKind=''; $details=''
-        $notes=New-Object 'System.Collections.Generic.List[string]'
-        if ($id -in @('4728','4732','4756','4729','4733','4757')) {
-            $group=$target; if ($targetSid) { $group+=' ('+$targetSid+')' }
-            if (Is-PrivilegedGroup $targetSid) { $groupKind='Административная' }
-            elseif ($targetSid -eq 'S-1-5-32-555') { $groupKind='Remote Desktop Users (RDP)' }
-            elseif ($targetSid -eq 'S-1-5-32-580') { $groupKind='Remote Management Users (WinRM)' }
-            $target=Triage-Value $r 'Участник группы'; $targetSid=Triage-Value $r 'SID участника'
-            if ($target -match '^CN=((?:\\,|[^,])+)') { $target=$Matches[1] }
-            if (-not $target) { $target=$targetSid }
-        } elseif ($id -eq '4740') {
-            $target=Triage-DataValue $r @('TargetUserName')
-            $details='Компьютер-источник блокировки: '+(Triage-DataValue $r @('TargetDomainName'))
-        } elseif ($id -eq '4781') {
-            $details=(Triage-DataValue $r @('OldTargetUserName'))+' → '+(Triage-DataValue $r @('NewTargetUserName'))
-        } elseif ($id -in @('4720','4738')) {
-            $changes=New-Object 'System.Collections.Generic.List[string]'
-            foreach ($name in $script:AccountChangeFields) { $v=Triage-DataValue $r @($name); if ($v -and $v -ne '-' -and $v -notmatch '^%%\d+$') { $changes.Add($name+'='+$v) } }
-            $uac=Triage-DataValue $r @('NewUacValue'); if ($uac) { $changes.Add('UAC '+(Triage-DataValue $r @('OldUacValue'))+' → '+$uac) }
-            $details=$changes.ToArray() -join '; '
-            if ($details.Length -gt 500) { $details=$details.Substring(0,500)+' [обрезано]' }
-            if ($id -eq '4738') { $weak=Get-UacChange $r $false; if ($weak) { $notes.Add('установлены флаги: '+$weak) } }
-        } elseif ($id -in @('4765','4766')) { $details='SID History: '+(Triage-DataValue $r @('SidHistory','SourceSid')) }
-        if ($targetSid -match '-500$') { $notes.Add('встроенная УЗ Администратор (RID 500)') }
-        elseif ($targetSid -match '-501$') { $notes.Add('встроенная УЗ Гость (RID 501)') }
-        if ($target.EndsWith('$') -and $id -notin @('4741','4743','4740')) { $notes.Add('имя оканчивается на $: похоже на УЗ компьютера, проверить') }
-        if ($groupKind) { $notes.Add('группа: '+$groupKind) }
-        $time=[string]$r.'Время UTC'
-        $items.Add([pscustomobject]@{Computer=[string]$r.'Компьютер';Ticks=(Get-IsoTicks $time);Row=@((Format-UtcText $time),(Format-LocalText $time),[string]$r.'Компьютер',$action,$target,$targetSid,$group,
-            $details,(Triage-Value $r 'Инициатор'),(Triage-Value $r 'SID инициатора'),(Triage-Value $r 'Logon ID инициатора'),(Triage-Value $r 'Результат аудита'),($notes.ToArray() -join '; '),$id,
-            (Triage-Value $r 'Номер'),(Triage-Value $r 'Record ID'),(Triage-Value $r 'Полный путь'),(Triage-Value $r 'Папка источника'))})
+$script:LevelText=@{critical='Критический';high='Высокий';medium='Средний';low='Низкий';informational='Инфо'}
+$script:LevelOrder=@{'Критический'=4;'Высокий'=3;'Средний'=2;'Низкий'=1;'Инфо'=0}
+# Правила: every loaded rule and chain with its count (0 = checked, nothing found);
+# Цепочки: every correlation found. Both from SigmaAlerts.csv of the Sigma engine.
+function Build-RuleSheets([string]$WorkPath,$Sigma) {
+    $alerts=@(); $path=Join-Path $WorkPath 'SigmaAlerts.csv'
+    if (Test-Path -LiteralPath $path) { $alerts=@(Import-Csv -LiteralPath $path -Delimiter $Delimiter -Encoding UTF8) }
+    $byId=@{}
+    foreach ($a in $alerts) {
+        $id=[string]$a.'ID правила'; $s=$byId[$id]
+        if ($null -eq $s) { $s=[pscustomobject]@{Count=[long]0;Computers=(New-Object 'System.Collections.Generic.List[string]');First='';Last=''}; $byId[$id]=$s }
+        if ([string]$a.'Тип' -like 'Корреляция*') { $s.Count++ } else { $s.Count+=[long]$a.'Событий' }
+        $computer=[string]$a.'Компьютер'
+        if ($computer -and -not $s.Computers.Contains($computer)) { $s.Computers.Add($computer) }
+        $first=[string]$a.'Первое время UTC'; $last=[string]$a.'Последнее время UTC'
+        if ($first -and (-not $s.First -or [string]::CompareOrdinal($first,$s.First) -lt 0)) { $s.First=$first }
+        if ($last -and (-not $s.Last -or [string]::CompareOrdinal($last,$s.Last) -gt 0)) { $s.Last=$last }
     }
-    $w=New-Writer (Join-Path $WorkPath 'AccountChanges.csv')
+    $rows=New-Object 'System.Collections.Generic.List[object]'
+    $engineType=$null; if ($Sigma) { $engineType=$Sigma.GetType() }
+    $addRow={ param($Rule,[string]$Type)
+        $level=$script:LevelText[[string]$Rule.Level]; if (-not $level) { $level=[string]$Rule.Level }
+        $st=$byId[[string]$Rule.Id]
+        $count=[long]0; $computers=''; $nComputers=0; $first=''; $last=''
+        if ($st) { $count=$st.Count; $computers=($st.Computers.ToArray() -join ' | '); $nComputers=$st.Computers.Count; $first=$st.First; $last=$st.Last }
+        $rows.Add([pscustomobject]@{Order=$script:LevelOrder[$level];Count=$count;Row=@($level,$engineType::GroupOf([string]$Rule.Group,$Rule.Tags),$Rule.Title,$Type,$count,$nComputers,$computers,$first,$last,
+            ([string]$Rule.Description).Replace("`n",' '),(@($Rule.FalsePositives) -join '; '),$Rule.Fstec,$Rule.Id)})
+    }
+    if ($Sigma) {
+        foreach ($r in $Sigma.Rules) { if ($r.Standalone -and [string]$r.Level -ne 'informational') { & $addRow $r 'Правило (событий)' } }
+        foreach ($c in $Sigma.Correlations) { & $addRow $c 'Цепочка (найдено)' }
+    }
+    $w=New-Writer (Join-Path $WorkPath 'SigmaRules.csv')
     try {
-        Write-Row $w @('Время UTC','Время (местное)','Компьютер','Действие','Учетная запись','SID учетной записи','Группа','Изменение / детали','Инициатор','SID инициатора','Logon ID инициатора','Результат','Примечание','Event ID','Номер находки','Record ID','Файл источника','Папка источника')
-        foreach ($item in ($items | Sort-Object Computer,Ticks)) { Write-Row $w $item.Row }
+        Write-Row $w @('Уровень','Группа','Правило','Тип','Количество','Компьютеров','Компьютеры','Первое время UTC','Последнее время UTC','Описание','Возможные причины','Меры ФСТЭК №239 (группы)','ID правила')
+        foreach ($r in ($rows | Sort-Object @{Expression={$_.Count -gt 0};Descending=$true},@{Expression={$_.Order};Descending=$true},@{Expression={$_.Count};Descending=$true})) { Write-Row $w $r.Row }
     } finally { Close-Writer $w }
-    return ,$items
+    $w=New-Writer (Join-Path $WorkPath 'Chains.csv')
+    try {
+        Write-Row $w @('Уровень','Компьютер','Начало UTC','Конец UTC','Группа','Цепочка','Ход событий','Группировка','Учетные записи','IP источника','Событий','Ссылки на события','Описание','Возможные причины')
+        $n=0
+        foreach ($a in $alerts) {
+            if ([string]$a.'Тип' -notlike 'Корреляция*') { continue }
+            $n++
+            $level=$script:LevelText[[string]$a.'Уровень Sigma']; if (-not $level) { $level=[string]$a.'Уровень Sigma' }
+            Write-Row $w @($level,$a.'Компьютер',$a.'Первое время UTC',$a.'Последнее время UTC',$a.'Группа',$a.'Правило',$a.'Цепочка событий',$a.'Группировка',$a.'Учетные записи',
+                $a.'IP источника',$a.'Событий',$a.'Ссылки на события',$a.'Описание',$a.'Ложные срабатывания')
+        }
+        if ($n -eq 0) { Write-Row $w @('','','','','','Цепочек событий не найдено','','','','','','','','') }
+    } finally { Close-Writer $w }
 }
-# One row per computer: what an auditor reads first.
-function Build-HostSheet([string]$WorkPath,$LogonRows,$UsbDevices,$Software,$Accounts,$Rows) {
+# Сводка: one row per computer — violations by level and group, logons, RDP, media, log coverage.
+function Build-SummarySheet([string]$WorkPath,$LogonRows,$UsbDevices,$Stats,[bool]$SigmaActive) {
     $hosts=@{}
     $get={ param([string]$Computer)
         $k=$Computer.ToLowerInvariant()
         $h=$hosts[$k]
         if ($null -eq $h) {
-            $h=[pscustomobject]@{Computer=$Computer;Folders=(New-Object 'System.Collections.Generic.List[string]');Channels=(New-Object 'System.Collections.Generic.List[string]');
-                First='';Last='';SecurityDays=[double]-1;P1=0;P2=0;Score=0;Scenarios=@{};Sigma=0;Success=[long]0;Failure=[long]0;
-                PublicIps=(New-Object 'System.Collections.Generic.List[string]');Rdp=@{};Usb=0;UsbBlocked=$false;Software=0;
-                Tools=(New-Object 'System.Collections.Generic.List[string]');Accounts=0;Clears=0;Crashes=0;Fstec=(New-Object 'System.Collections.Generic.List[string]');BadFiles=0}
+            $h=[pscustomobject]@{Computer=$Computer;Channels=(New-Object 'System.Collections.Generic.List[string]');First='';Last='';SecurityDays=[double]-1;BadFiles=0;
+                Total=[long]0;High=[long]0;Medium=[long]0;Low=[long]0;Chains=0;Groups=@{};Titles=@{};Success=[long]0;Failure=[long]0;Rdp=@{};Usb=0}
             $hosts[$k]=$h
         }
         return $h
@@ -6899,8 +8429,6 @@ function Build-HostSheet([string]$WorkPath,$LogonRows,$UsbDevices,$Software,$Acc
             if (($channels -contains 'Security') -and $first -and $last) { try { $days=((Get-IsoTicks $last)-(Get-IsoTicks $first))/[double][TimeSpan]::TicksPerDay } catch { } }
             foreach ($c in (([string]$f.'Компьютеры') -split ' \| ' | Where-Object { $_ })) {
                 $h=& $get $c
-                $folder=[IO.Path]::GetDirectoryName([string]$f.'Полный путь')
-                if ($folder -and $h.Folders.Count -lt 5 -and -not $h.Folders.Contains($folder)) { $h.Folders.Add($folder) }
                 foreach ($ch in $channels) { if (-not $h.Channels.Contains($ch)) { $h.Channels.Add($ch) } }
                 if ($first -and (-not $h.First -or [string]::CompareOrdinal($first,$h.First) -lt 0)) { $h.First=$first }
                 if ($last -and (-not $h.Last -or [string]::CompareOrdinal($last,$h.Last) -gt 0)) { $h.Last=$last }
@@ -6909,31 +8437,27 @@ function Build-HostSheet([string]$WorkPath,$LogonRows,$UsbDevices,$Software,$Acc
             }
         }
     }
-    foreach ($inc in @($script:TriageIncidents)) {
-        if (-not $inc.Computer) { continue }
-        $h=& $get $inc.Computer
-        if ($inc.Priority -eq $script:P1) { $h.P1++ } elseif ($inc.Priority -eq $script:P2) { $h.P2++ }
-        if ($inc.Score -gt $h.Score) { $h.Score=$inc.Score }
-    }
-    foreach ($g in @($script:TriageGroups.Values)) {
-        if (-not $g.Computer) { continue }
-        $h=& $get $g.Computer
-        if (-not $h.Scenarios.ContainsKey($g.Scenario) -or $h.Scenarios[$g.Scenario] -lt $g.Score) { $h.Scenarios[$g.Scenario]=$g.Score }
-        if ($g.Score -gt $h.Score) { $h.Score=$g.Score }
-        foreach ($m in ([string]$g.Fstec -split ',\s*')) { if ($m -and -not $h.Fstec.Contains($m)) { $h.Fstec.Add($m) } }
+    $usedGroups=New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($st in $Stats) {
+        if (-not $st.Computer) { continue }
+        $h=& $get $st.Computer; $n=[long]$st.Count
+        $h.Total+=$n
+        if ($st.Level -in @('Критический','Высокий')) { $h.High+=$n } elseif ($st.Level -eq 'Средний') { $h.Medium+=$n } else { $h.Low+=$n }
+        $group=[string]$st.Group; if (-not $group) { $group='Прочее' }
+        [void]$usedGroups.Add($group)
+        if ($h.Groups.ContainsKey($group)) { $h.Groups[$group]+=$n } else { $h.Groups[$group]=$n }
+        if ($h.Titles.ContainsKey($st.Title)) { $h.Titles[$st.Title]+=$n } else { $h.Titles[$st.Title]=$n }
     }
     $sigmaPath=Join-Path $WorkPath 'SigmaAlerts.csv'
     if (Test-Path -LiteralPath $sigmaPath) {
-        foreach ($a in (Import-Csv -LiteralPath $sigmaPath -Delimiter $Delimiter -Encoding UTF8)) { if ($a.'Компьютер') { $h=& $get $a.'Компьютер'; $h.Sigma++ } }
+        foreach ($a in (Import-Csv -LiteralPath $sigmaPath -Delimiter $Delimiter -Encoding UTF8)) {
+            if ([string]$a.'Тип' -like 'Корреляция*' -and $a.'Компьютер') { $h=& $get $a.'Компьютер'; $h.Chains++ }
+        }
     }
     foreach ($l in $LogonRows) {
         if (-not $l.Computer) { continue }
         $h=& $get $l.Computer
-        if ($l.Result -eq $script:ResultSuccess) {
-            $h.Success+=[long]$l.Count
-            $ip=Triage-NormalIp ([string]$l.Source)
-            if ((Triage-IsPublicIp $ip) -and $h.PublicIps.Count -lt 10 -and -not $h.PublicIps.Contains($ip)) { $h.PublicIps.Add($ip) }
-        } else { $h.Failure+=[long]$l.Count }
+        if ($l.Result -eq $script:ResultSuccess) { $h.Success+=[long]$l.Count } else { $h.Failure+=[long]$l.Count }
     }
     foreach ($t in @($script:RdpTotals.Values)) {
         if (-not $t.Computer) { continue }
@@ -6941,66 +8465,48 @@ function Build-HostSheet([string]$WorkPath,$LogonRows,$UsbDevices,$Software,$Acc
         # Security and TerminalServices describe the same sessions: totals are kept per data source.
         if (-not $h.Rdp.ContainsKey($t.Source)) { $h.Rdp[$t.Source]=@([long]0,[double]0) }
         $h.Rdp[$t.Source][0]+=[long]$t.Count; $h.Rdp[$t.Source][1]+=[double]$t.Seconds
-        $ip=Triage-NormalIp ([string]$t.SourceIP)
-        if ((Triage-IsPublicIp $ip) -and $h.PublicIps.Count -lt 10 -and -not $h.PublicIps.Contains($ip)) { $h.PublicIps.Add($ip) }
     }
-    foreach ($d in @($UsbDevices.Values)) {
-        foreach ($c in $d.Computers) { $h=& $get $c; $h.Usb++; if ($d.Blocked) { $h.UsbBlocked=$true } }
-    }
-    foreach ($s in $Software) {
-        if (-not $s.Computer) { continue }
-        $h=& $get $s.Computer; $h.Software++
-        if ($s.Tool -and -not $h.Tools.Contains($s.Tool.ToLowerInvariant())) { $h.Tools.Add($s.Tool.ToLowerInvariant()) }
-    }
-    foreach ($a in $Accounts) { if ($a.Computer) { $h=& $get $a.Computer; $h.Accounts++ } }
-    foreach ($r in $Rows) {
-        $provider=[string]$r.'Провайдер'; $id=[string]$r.'Event ID'
-        if (-not $r.'Компьютер') { continue }
-        if ($provider -eq 'Microsoft-Windows-Eventlog' -and ($id -eq '104' -or $id -eq '1102')) { $h=& $get $r.'Компьютер'; $h.Clears++ }
-        elseif (($provider -eq 'Microsoft-Windows-Kernel-Power' -and $id -eq '41') -or ($provider -eq 'EventLog' -and $id -eq '6008')) { $h=& $get $r.'Компьютер'; $h.Crashes++ }
-    }
+    foreach ($d in @($UsbDevices.Values)) { foreach ($c in $d.Computers) { $h=& $get $c; $h.Usb++ } }
+    $groups=@($script:ViolationGroups | Where-Object { $usedGroups.Contains($_) })
+    foreach ($g in $usedGroups) { if ($g -notin $groups) { $groups+=$g } }
     $w=New-Writer (Join-Path $WorkPath 'Hosts.csv')
     try {
-        Write-Row $w @('Компьютер','Приоритет','Оценка риска','КИ P1','КИ P2','Главные сценарии','Срабатываний Sigma','Меры ФСТЭК №239 (группы)','Успешных входов','Неудачных входов',
-            'Внешние IP (успешные входы, RDP)','RDP-сеансов','RDP суммарно (ч:мм:сс)','Съемных носителей','Изменений ПО','Средства удаленного доступа','Изменений УЗ','Очисток журналов','Аварийных перезагрузок',
-            'Журналы (каналы)','Период событий с (UTC)','Период событий по (UTC)','Глубина Security, дней','Папки источника','Замечания')
-        foreach ($h in (@($hosts.Values) | Sort-Object @{Expression={$_.Score};Descending=$true},Computer)) {
-            $top=@($h.Scenarios.GetEnumerator() | Sort-Object @{Expression={$_.Value};Descending=$true},Name | Select-Object -First 5 | ForEach-Object { $_.Name+' ('+$_.Value+')' })
+        Write-Row $w (@('Компьютер','Нарушений всего','Критических и высоких','Средних','Низких','Цепочек')+$groups+@('Основные нарушения','Успешных входов','Неудачных входов',
+            'RDP-сеансов','RDP суммарно (ч:мм:сс)','Съемных носителей','Период событий с (UTC)','Период событий по (UTC)','Глубина Security, дней','Замечания'))
+        foreach ($h in (@($hosts.Values) | Sort-Object @{Expression={$_.High};Descending=$true},@{Expression={$_.Total};Descending=$true},Computer)) {
+            $top=@($h.Titles.GetEnumerator() | Sort-Object @{Expression={$_.Value};Descending=$true},Name | Select-Object -First 5 | ForEach-Object { $_.Name+' ('+$_.Value+')' })
             $rdpSource=''; if ($h.Rdp.ContainsKey('Security')) { $rdpSource='Security' } elseif ($h.Rdp.Count -gt 0) { $rdpSource=@($h.Rdp.Keys)[0] }
             $rdpCount=''; $rdpTime=''
             if ($rdpSource) { $rdpCount=$h.Rdp[$rdpSource][0]; $rdpTime=Format-Duration $h.Rdp[$rdpSource][1] }
             $notes=New-Object 'System.Collections.Generic.List[string]'
-            if (-not $h.Channels.Contains('Security')) { $notes.Add('журнал Security не передан: выводы о входах и УЗ ограничены') }
-            elseif ($h.SecurityDays -ge 0 -and $h.SecurityDays -lt 30) { $notes.Add('журнал Security охватывает '+[Math]::Round($h.SecurityDays,1).ToString('0.#',$script:Invariant)+' дн.: проверить размер журнала и централизованный сбор') }
-            if ($h.Clears -gt 0) { $notes.Add('журналы очищались: '+$h.Clears) }
-            if ($h.Tools.Count -gt 0) { $notes.Add('средства удаленного доступа: проверить согласование и учет') }
-            if ($h.PublicIps.Count -gt 0) { $notes.Add('успешные входы с внешних IP') }
-            if ($h.UsbBlocked) { $notes.Add('попытка подключить запрещенное устройство (6423)') }
-            if ($h.Crashes -gt 0) { $notes.Add('аварийные перезагрузки (41/6008): проверить причины и влияние на технологический процесс') }
+            if (-not $SigmaActive) { $notes.Add('правила Sigma не применялись (совместимый режим): лист Нарушения не заполнен') }
+            if (-not $h.Channels.Contains('Security')) { $notes.Add('журнал Security не передан: входы, учетные записи и время не проверены') }
+            elseif ($h.SecurityDays -ge 0 -and $h.SecurityDays -lt 30) { $notes.Add('журнал Security охватывает '+[Math]::Round($h.SecurityDays,1).ToString('0.#',$script:Invariant)+' дн.: проверить размер журнала') }
+            if (-not $h.Channels.Contains('System')) { $notes.Add('журнал System не передан: службы, перезагрузки и очистка журналов не проверены') }
+            if (-not $h.Channels.Contains('Microsoft-Windows-Kernel-PnP/Configuration') -and -not $h.Channels.Contains('Microsoft-Windows-Partition/Diagnostic')) { $notes.Add('нет журналов Kernel-PnP и Partition: носители видны только при аудите PnP (6416)') }
             if ($h.BadFiles -gt 0) { $notes.Add('файлов с неполной обработкой: '+$h.BadFiles) }
-            $priority=''; if ($h.Score -gt 0) { $priority=Get-PriorityFromScore $h.Score }
             $days=''; if ($h.SecurityDays -ge 0) { $days=[Math]::Round($h.SecurityDays,1).ToString('0.#',$script:Invariant) }
-            Write-Row $w @($h.Computer,$priority,$h.Score,$h.P1,$h.P2,($top -join ' | '),$h.Sigma,(($h.Fstec.ToArray() | Sort-Object) -join ', '),$h.Success,$h.Failure,
-                ($h.PublicIps.ToArray() -join ' | '),$rdpCount,$rdpTime,$h.Usb,$h.Software,($h.Tools.ToArray() -join ' | '),$h.Accounts,$h.Clears,$h.Crashes,
-                ($h.Channels.ToArray() -join ' | '),(Format-UtcText $h.First),(Format-UtcText $h.Last),$days,($h.Folders.ToArray() -join ' | '),($notes.ToArray() -join '; '))
+            $groupCounts=@(foreach ($g in $groups) { if ($h.Groups.ContainsKey($g)) { $h.Groups[$g] } else { 0 } })
+            Write-Row $w (@($h.Computer,$h.Total,$h.High,$h.Medium,$h.Low,$h.Chains)+$groupCounts+@(($top -join ' | '),$h.Success,$h.Failure,$rdpCount,$rdpTime,$h.Usb,
+                (Format-UtcText $h.First),(Format-UtcText $h.Last),$days,($notes.ToArray() -join '; ')))
         }
     } finally { Close-Writer $w }
 }
-function Build-AuditSheets([string]$WorkPath,$LogonRows) {
-    $failures=0; $rows=@(); $usb=@{}; $software=@(); $accounts=@()
+function Build-AuditSheets([string]$WorkPath,$LogonRows,$Sigma) {
+    $failures=0; $rows=@(); $usb=@{}
     try { $rows=Get-AuditRows $WorkPath }
-    catch { $failures++; Log-Issue 'Report' $WorkPath '' ('Не прочитаны строки для листов носителей, ПО и УЗ: '+(Get-TriageErrorText $_)) }
+    catch { $failures++; Log-Issue 'Report' $WorkPath '' ('Не прочитаны строки для листа съемных носителей: '+(Get-TriageErrorText $_)) }
     try { $usb=Build-UsbSheets $WorkPath $rows (New-InteractiveIndex $rows) }
-    catch { $failures++; Log-Issue 'Report' $WorkPath '' ('Не сформированы листы съемных носителей: '+(Get-TriageErrorText $_)) }
-    try { $software=Build-SoftwareSheet $WorkPath $rows }
-    catch { $failures++; Log-Issue 'Report' $WorkPath '' ('Не сформирован лист Изменения_ПО: '+(Get-TriageErrorText $_)) }
-    try { $accounts=Build-AccountSheet $WorkPath $rows }
-    catch { $failures++; Log-Issue 'Report' $WorkPath '' ('Не сформирован лист Учетные_записи: '+(Get-TriageErrorText $_)) }
-    try { Build-HostSheet $WorkPath $LogonRows $usb $software $accounts $rows }
-    catch { $failures++; Log-Issue 'Report' $WorkPath '' ('Не сформирован лист Хосты: '+(Get-TriageErrorText $_)) }
+    catch { $failures++; Log-Issue 'Report' $WorkPath '' ('Не сформирован лист Съемные_носители: '+(Get-TriageErrorText $_)) }
+    $stats=@()
+    if ($Sigma) {
+        try { Build-RuleSheets $WorkPath $Sigma } catch { $failures++; Log-Issue 'Report' $WorkPath '' ('Не сформированы листы Правила и Цепочки: '+(Get-TriageErrorText $_)) }
+        $stats=$Sigma.GetViolationStats()
+    }
+    try { Build-SummarySheet $WorkPath $LogonRows $usb $stats ([bool]$Sigma) }
+    catch { $failures++; Log-Issue 'Report' $WorkPath '' ('Не сформирован лист Сводка: '+(Get-TriageErrorText $_)) }
     return $failures
 }
-
 function Test-V4 {
     $payload='<EventData><Data Name="Value">A'+[char]16+'B</Data></EventData>'
     $raw=Test-Xml 1000 'Application Error' $payload
@@ -7435,7 +8941,7 @@ function Test-V92Triage {
         $scoreIndex=[array]::IndexOf([string[]]$triagePlan.Headers,'Оценка риска')
         Assert-True ($triagePlan.Types[$scoreIndex] -eq 1 -and $triagePlan.Types[[array]::IndexOf([string[]]$triagePlan.Headers,'Event ID')] -eq 2 -and $triagePlan.PriorityColumn -eq 2 -and $triagePlan.Wrap.Count -ge 4) 'v9.2 Excel plan: numeric score, text IDs, priority colors, wrapping'
         $findPlan=@($plan | Where-Object { $_.Kind -eq 'Findings' })[0]
-        Assert-True ($findPlan.Hidden -contains ([array]::IndexOf([string[]]$findPlan.Headers,'SHA256 XML события')+1)) 'v9.2 Excel plan hides technical finding columns'
+        Assert-True ('SHA256 XML события' -notin $findPlan.Headers -and 'Что проверить' -notin $findPlan.Headers -and @($findPlan.Types | Where-Object { $_ -eq 9 }).Count -gt 0) 'v9.2 Excel plan: technical finding columns not imported'
         Assert-True ((Get-ColumnLetter 1) -eq 'A' -and (Get-ColumnLetter 26) -eq 'Z' -and (Get-ColumnLetter 27) -eq 'AA' -and (Get-ColumnLetter 46) -eq 'AT') 'v9.2 Excel column letters'
         New-FallbackOverview $tmp (Join-Path $tmp 'overview.csv')
         $overview=@(Import-Csv -LiteralPath (Join-Path $tmp 'overview.csv') -Delimiter $Delimiter -Encoding UTF8)
@@ -7678,7 +9184,7 @@ function Test-V10 {
         Assert-True ($compared -ge 25) ('v10 compiled parser equals XML parser on '+$compared+' events')
         # 2. Embedded Sigma pack: every rule is supported; selectors reach the Windows query.
         $sigma=New-SigmaEngine @()
-        Assert-True ($sigma.Problems.Count -eq 0 -and $sigma.Skipped -eq 0 -and $sigma.RuleCount -ge 30 -and $sigma.CorrelationCount -ge 15) ('v10 Sigma pack: '+$sigma.RuleCount+' rules, '+$sigma.CorrelationCount+' correlations, nothing skipped')
+        Assert-True ($sigma.Problems.Count -eq 0 -and $sigma.Skipped -eq 0 -and $sigma.RuleCount -ge 60 -and $sigma.CorrelationCount -ge 10) ('v10 Sigma pack: '+$sigma.RuleCount+' rules, '+$sigma.CorrelationCount+' correlations, nothing skipped')
         $script:SigmaSelectors=New-Object 'System.Collections.Generic.List[string]'; $script:QueryCache=@{}
         foreach ($s in $sigma.GetSelectors($MaxEventId)) { $script:SigmaSelectors.Add($s) }
         $query=Build-Query 'C:\Logs\Security.evtx' $false
@@ -7687,14 +9193,32 @@ function Test-V10 {
         if ($MaxEventId -lt 7045) { Write-Host 'v10 end-to-end test skipped: -MaxEventId excludes fixture events'; return }
         # 3. End to end: engine + Sigma -> priority sheet, incidents, hosts and audit sheets.
         $c=Invoke-V10Engine $e2e $evtx $events $sigma
+        $vw=New-Writer (Join-Path $e2e 'Violations.csv')
+        try { $violationCount=$sigma.WriteViolations($vw,[string]$Delimiter) } finally { Close-Writer $vw }
         $alerts=@(Import-Csv -LiteralPath (Join-Path $e2e 'SigmaAlerts.csv') -Delimiter $Delimiter -Encoding UTF8)
         $titles=@($alerts | ForEach-Object { $_.'Правило' })
-        foreach ($expected in @('Установлено средство удаленного доступа (служба)','Установлено средство удаленного доступа (Windows Installer)','Создана скрытая учетная запись (имя оканчивается на $)',
-            'RDP-вход под встроенной учетной записью Администратор','Подключение USB-накопителя и установка службы (Kernel-PnP)','Установка службы с последующей очисткой журнала Security')) {
+        foreach ($expected in @('Многократные неудачные попытки входа одной учетной записи','Подключение носителя → установка программы или службы',
+            'Установка программы или службы → очистка журнала','Установлено средство удаленного доступа (служба)','Установлено средство удаленного доступа (Windows Installer)',
+            'Создана скрытая учетная запись (имя оканчивается на $)','Вход под встроенной учетной записью Администратор','Системное время изменено пользователем')) {
+            if ($expected -eq 'Системное время изменено пользователем') { Assert-True ($expected -notin $titles) 'v10 Sigma: no time-change alert without 4616 by a user'; continue }
             Assert-True ($expected -in $titles) ('v10 Sigma alert: '+$expected)
         }
-        $chain=@($alerts | Where-Object { $_.'Правило' -eq 'Подключение USB-накопителя и установка службы (Kernel-PnP)' })[0]
-        Assert-True ($chain.'Тип' -like 'Корреляция temporal_ordered*' -and $chain.'Ссылки на события' -like '*#*' -and $chain.'Меры ФСТЭК №239 (группы)' -like '*ЗНИ*') 'v10 Sigma correlation: chain, event links and FSTEC groups'
+        $chain=@($alerts | Where-Object { $_.'Правило' -eq 'Подключение носителя → установка программы или службы' })[0]
+        Assert-True ($chain.'Тип' -like 'Корреляция temporal_ordered*' -and $chain.'Ссылки на события' -like '*#*' -and $chain.'Меры ФСТЭК №239 (группы)' -like '*ЗНИ*' -and $chain.'Группа' -eq 'Съемные носители') 'v10 Sigma chain: steps, event links, FSTEC groups, report group'
+        # Нарушения: one row per violating event (Chainsaw-style), merged rules, who and what.
+        $viol=@(Import-Csv -LiteralPath (Join-Path $e2e 'Violations.csv') -Delimiter $Delimiter -Encoding UTF8)
+        Assert-True ($viol.Count -eq 12 -and $violationCount -eq 12) ('v10 violations: one row per violating event ('+$viol.Count+')')
+        $sorted=$true; for ($i=1;$i -lt $viol.Count;$i++) { if ([string]::CompareOrdinal($viol[$i].'Время UTC',$viol[$i-1].'Время UTC') -lt 0) { $sorted=$false } }
+        Assert-True $sorted 'v10 violations sorted by time'
+        $rdp=@($viol | Where-Object { $_.'Нарушение' -like 'RDP-вход с внешнего адреса*' })[0]
+        Assert-True ($rdp.'Уровень' -eq 'Высокий' -and $rdp.'Пользователь' -eq 'WS01\admin' -and $rdp.'Детали' -like '*IP: 45.10.20.30*' -and $rdp.'Нарушение' -like '*Вход под встроенной учетной записью Администратор*' -and $rdp.'Нарушение' -like '*| RDP-вход*' -and $rdp.'Группа' -eq 'Удаленный доступ' -and $rdp.'Время (местное)') 'v10 violation: rules of one event merged, user and details'
+        $msi=@($viol | Where-Object { $_.'Event ID' -eq '1033' })[0]
+        Assert-True ($msi.'Детали' -like 'Продукт: AnyDesk; Версия: 7.1.0; Производитель: AnyDesk Software GmbH*' -and $msi.'Пользователь' -eq 'WS01\operator (S-1-5-21-1-2-3-1100)' -and $msi.'Нарушение' -eq 'Установлена программа (Windows Installer) | Установлено средство удаленного доступа (Windows Installer)' -and $msi.'Группа' -eq 'Установка ПО и служб') 'v10 violation: MSI product, version, vendor and installing user'
+        $media=@($viol | Where-Object { $_.'Нарушение' -eq 'Подключен съемный накопитель (USB, SD)' })
+        Assert-True ($media.Count -eq 3 -and @($media | Where-Object { $_.'Детали' -like '*Серийный №: 4C530001231122115172*' }).Count -eq 1 -and $media[0].'Группа' -eq 'Съемные носители' -and @($media | Where-Object { $_.'Пользователь' -eq 'вероятно WS01\operator (вход 2026-03-02 08:00:00 UTC, тип 2, выход не зафиксирован)' }).Count -eq 3) 'v10 violation: USB storage from three logs, probable user from active logon'
+        Assert-True (@($viol | Where-Object { $_.'Нарушение' -eq 'Установлено обновление Windows' }).Count -eq 1 -and @($viol | Where-Object { $_.'Нарушение' -like '*очищен журнал Security*' -or $_.'Нарушение' -eq 'Очищен журнал Security' })[0].'Пользователь' -eq 'WS01\admin') 'v10 violations: signature updates skipped, log clearing attributed'
+        $time=@($viol | Where-Object { $_.'Нарушение' -like '*параметры учетной записи*' })[0]
+        Assert-True ($time.'Уровень' -eq 'Низкий' -and $time.'Детали' -like '*Флаги было: 0x210; Флаги стало: 0x10210*') 'v10 violation: low level and UAC values in details'
         Write-RdpTotals (Join-Path $e2e 'RdpTotals.csv')
         Write-LogonSummary (Join-Path $e2e 'LogonSummary.csv') $c.Logons
         $fw=New-Writer (Join-Path $e2e 'Files.csv')
@@ -7703,14 +9227,14 @@ function Test-V10 {
         Write-Row $fw @((Join-Path $root 'WS01\System.evtx'),'1','','','OK','5','5','0','0','2026-01-01T00:00:00.0000000Z','2026-03-02T11:10:00.0000000Z','System','WS01.lab.local','Правила','','1')
         Close-Writer $fw
         $script:ErrorWriter.Flush()
+        # Attack triage (-AttackTriage): Sigma chains appear on the priority sheet too.
         Build-Triage $e2e
-        Assert-True (-not $script:TriageHasErrors) 'v10 end to end: triage without errors'
+        Assert-True (-not $script:TriageHasErrors) 'v10 attack triage: no errors'
         $triage=@(Import-Csv -LiteralPath (Join-Path $e2e 'Triage.csv') -Delimiter $Delimiter -Encoding UTF8 | Where-Object { $_.'Приоритет' -ne 'Справка' })
         $sigmaRows=@($triage | Where-Object { $_.'Сценарий' -like 'Sigma: *' })
-        Assert-True ($sigmaRows.Count -ge 4 -and @($sigmaRows | Where-Object { $_.'Источник правила' -notlike 'Sigma *' }).Count -eq 0) ('v10 priority sheet: Sigma chains and rules ('+$sigmaRows.Count+' rows)')
-        $usbChain=@($sigmaRows | Where-Object { $_.'Сценарий' -eq 'Sigma: Подключение USB-накопителя и установка службы' })
-        Assert-True ($usbChain.Count -eq 1 -and $usbChain[0].'КИ' -like 'КИ-*' -and $usbChain[0].'Ссылки на находки и EVTX (до 10)' -like '*Security.evtx#*' -and $usbChain[0].'Event ID' -eq '400, 1006, 6416, 7045') 'v10 priority sheet: USB chain variants merged, linked to incident, events and IDs'
-        Assert-True (@($sigmaRows | Where-Object { $_.'Сценарий' -like 'Sigma: Подключен съемный носитель*' }).Count -eq 1 -and @($sigmaRows | Where-Object { $_.'Сценарий' -eq 'Sigma: Установлено средство удаленного доступа' }).Count -eq 1) 'v10 priority sheet: one row per fact for media and remote-access rules'
+        $usbChain=@($sigmaRows | Where-Object { $_.'Сценарий' -eq 'Sigma: Подключение носителя → установка программы или службы' })
+        Assert-True ($usbChain.Count -eq 1 -and $usbChain[0].'КИ' -like 'КИ-*' -and $usbChain[0].'Ссылки на находки и EVTX (до 10)' -like '*Security.evtx#*' -and $usbChain[0].'Event ID' -match '6416|400|1006' -and $usbChain[0].'Event ID' -match '1033|7045') 'v10 attack triage: Sigma chain linked to incident, events and IDs'
+        Assert-True (@($sigmaRows | Where-Object { $_.'Сценарий' -eq 'Sigma: Установлено средство удаленного доступа' }).Count -eq 1) 'v10 attack triage: one row per fact for rule variants'
         $scenarios=@($triage | ForEach-Object { $_.'Сценарий' })
         foreach ($expected in @('Ослаблены параметры безопасности УЗ','Отказы RDP с неверным паролем → успешный вход','RDP-сеанс: создание УЗ','Очистка журнала')) {
             Assert-True ($expected -in $scenarios) ('v10 heuristics: '+$expected)
@@ -7718,37 +9242,37 @@ function Test-V10 {
         Build-LogCoverage $e2e
         $coverage=@(Import-Csv -LiteralPath (Join-Path $e2e 'Coverage.csv') -Delimiter $Delimiter -Encoding UTF8)
         Assert-True ($coverage[0].'Глубина Security, дней' -eq '2.1' -and $coverage[0].'Что это означает / что запросить' -like '*охватывает только 2.1 дн.*') 'v10 coverage: Security depth and retention note'
-        $failures=Build-AuditSheets $e2e $c.Logons
+        $failures=Build-AuditSheets $e2e $c.Logons $sigma
         if ($failures -gt 0) { $script:ErrorWriter.Flush(); Get-Content -LiteralPath (Join-Path $root 'Errors.csv') -Encoding UTF8 | Select-Object -Last $failures | ForEach-Object { Write-Host $_ } }
-        Assert-True ($failures -eq 0) 'v10 audit sheets built without errors'
+        Assert-True ($failures -eq 0) 'v10 report sheets built without errors'
+        $rules=@(Import-Csv -LiteralPath (Join-Path $e2e 'SigmaRules.csv') -Delimiter $Delimiter -Encoding UTF8)
+        $usbRule=@($rules | Where-Object { $_.'Правило' -eq 'Подключен съемный накопитель (USB, SD)' })[0]
+        $wifi=@($rules | Where-Object { $_.'Правило' -eq 'Подключение к сети Wi-Fi' })[0]
+        Assert-True ($rules.Count -ge 60 -and [long]$usbRule.'Количество' -eq 3 -and $usbRule.'Компьютеры' -eq 'WS01.lab.local' -and $wifi.'Количество' -eq '0' -and [long]$rules[0].'Количество' -gt 0 -and @($rules | Where-Object { $_.'Тип' -like 'Цепочка*' }).Count -eq $sigma.CorrelationCount) 'v10 rules sheet: every rule and chain with its count (0 = checked)'
+        $chains=@(Import-Csv -LiteralPath (Join-Path $e2e 'Chains.csv') -Delimiter $Delimiter -Encoding UTF8)
+        Assert-True ($chains.Count -eq @($alerts | Where-Object { $_.'Тип' -like 'Корреляция*' }).Count -and $chains.Count -ge 3 -and @($chains | Where-Object { $_.'Ход событий' -like '*→*' }).Count -ge 2) 'v10 chains sheet'
         $usb=@(Import-Csv -LiteralPath (Join-Path $e2e 'UsbDevices.csv') -Delimiter $Delimiter -Encoding UTF8)
         Assert-True ($usb.Count -eq 1 -and $usb[0].'Серийный номер' -eq '4C530001231122115172' -and $usb[0].'Устройство' -eq 'SanDisk Cruzer Blade' -and $usb[0].'VID/PID' -eq 'VID_0781&PID_5567' -and
             $usb[0].'Подключений (оценка)' -eq '1' -and $usb[0].'Емкость, ГБ' -eq '16' -and $usb[0].'Вероятные пользователи' -eq 'WS01\operator') 'v10 removable media: one device merged from 6416, Kernel-PnP and Partition'
-        $usbEvents=@(Import-Csv -LiteralPath (Join-Path $e2e 'UsbEvents.csv') -Delimiter $Delimiter -Encoding UTF8)
-        Assert-True ($usbEvents.Count -eq 3 -and @($usbEvents | Where-Object { $_.'Вероятный пользователь (активный вход)' -eq 'WS01\operator (тип 2, вход 2026-03-02 08:00:00 UTC, выход не зафиксирован)' }).Count -eq 3) 'v10 media events: SATA disk ignored, user inferred from console logon'
-        $soft=@(Import-Csv -LiteralPath (Join-Path $e2e 'SoftwareChanges.csv') -Delimiter $Delimiter -Encoding UTF8)
-        $msi=@($soft | Where-Object { $_.'Event ID' -eq '1033' })[0]; $svc=@($soft | Where-Object { $_.'Event ID' -eq '7045' })[0]
-        Assert-True ($msi.'Продукт / служба / обновление' -eq 'AnyDesk' -and $msi.'Версия' -eq '7.1.0' -and $msi.'Производитель' -eq 'AnyDesk Software GmbH' -and $msi.'Риск / примечание' -like 'средство удаленного доступа*' -and $msi.'Инициатор' -eq 'S-1-5-21-1-2-3-1100') 'v10 software: MSI product, version, vendor, user SID and remote-access flag'
-        Assert-True ($svc.'Путь / параметры' -like '"C:\Program Files (x86)\AnyDesk\AnyDesk.exe" --service | запуск: auto start*' -and @($soft | Where-Object { $_.'Результат' -eq 'Успешно: 2' }).Count -eq 1 -and $soft.Count -eq 4) 'v10 software: service row and one summary row for signature updates'
-        $acc=@(Import-Csv -LiteralPath (Join-Path $e2e 'AccountChanges.csv') -Delimiter $Delimiter -Encoding UTF8)
-        $uac=@($acc | Where-Object { $_.'Event ID' -eq '4738' })[0]; $lock=@($acc | Where-Object { $_.'Event ID' -eq '4740' })[0]
-        Assert-True ($uac.'Примечание' -like '*AS-REP Roasting*' -and $uac.'Учетная запись' -eq 'WS01\svc_sql' -and $lock.'Изменение / детали' -eq 'Компьютер-источник блокировки: PC-BUH' -and $lock.'Учетная запись' -eq 'buh') 'v10 accounts: UAC flags decoded, lockout source'
         $logons=@(Import-Csv -LiteralPath (Join-Path $e2e 'LogonSummary.csv') -Delimiter $Delimiter -Encoding UTF8)
         $rdpFail=@($logons | Where-Object { $_.'Event ID' -eq '4625' })[0]; $ntlm=@($logons | Where-Object { $_.'Event ID' -eq '4776' })[0]; $krb=@($logons | Where-Object { $_.'Event ID' -eq '4771' })[0]
         Assert-True ($rdpFail.'Количество' -eq '12' -and $rdpFail.'Внешний IP' -eq 'Да' -and $rdpFail.'Расшифровка кодов' -like '*0xc000006a — неверный пароль*' -and $rdpFail.'Описание типа' -like 'Удаленный интерактивный*' -and
             $ntlm.'Расшифровка кодов' -eq '0xc0000064 — нет такой УЗ' -and $ntlm.'Источник (IP / станция)' -eq 'KALI' -and $krb.'Расшифровка кодов' -eq '0x18 — неверный пароль' -and $krb.'Источник (IP / станция)' -eq '10.0.0.50') 'v10 logons: counts, public IP, decoded failure codes'
         $hosts=@(Import-Csv -LiteralPath (Join-Path $e2e 'Hosts.csv') -Delimiter $Delimiter -Encoding UTF8)
         $h=$hosts[0]
-        Assert-True ($hosts.Count -eq 1 -and $h.'Компьютер' -eq 'WS01.lab.local' -and $h.'Приоритет' -eq $script:P1 -and [int]$h.'КИ P1' -ge 1 -and [int]$h.'Срабатываний Sigma' -ge 5 -and
-            $h.'Средства удаленного доступа' -eq 'anydesk' -and $h.'Съемных носителей' -eq '1' -and $h.'Внешние IP (успешные входы, RDP)' -eq '45.10.20.30' -and $h.'RDP-сеансов' -eq '1' -and
-            $h.'RDP суммарно (ч:мм:сс)' -eq '0:30:00' -and $h.'Очисток журналов' -eq '1' -and $h.'Глубина Security, дней' -eq '2.1' -and $h.'Меры ФСТЭК №239 (группы)' -like '*ЗНИ*' -and $h.'Замечания' -like '*журналы очищались*') 'v10 hosts: one row with incidents, Sigma, RDP, media, software and notes'
+        Assert-True ($hosts.Count -eq 1 -and $h.'Компьютер' -eq 'WS01.lab.local' -and $h.'Нарушений всего' -eq '12' -and $h.'Критических и высоких' -eq '8' -and $h.'Средних' -eq '2' -and $h.'Низких' -eq '2' -and
+            [int]$h.'Цепочек' -ge 3 -and $h.'Съемные носители' -eq '3' -and $null -eq $h.PSObject.Properties['Изменение времени'] -and $h.'Основные нарушения' -like 'Подключен съемный накопитель (USB, SD) (3)*' -and $h.'Съемных носителей' -eq '1' -and
+            $h.'RDP-сеансов' -eq '1' -and $h.'RDP суммарно (ч:мм:сс)' -eq '0:30:00' -and $h.'Глубина Security, дней' -eq '2.1' -and $h.'Замечания' -like '*журнал Security охватывает 2.1 дн.*') 'v10 summary: violations by level and group, RDP, media, log depth'
         $plan=Get-ExcelSheetPlan $e2e
         $names=@($plan | ForEach-Object { $_.Name })
-        Assert-True (($names[0..5] -join ',') -eq 'Хосты,Инциденты,Приоритетные,Sigma,Подбор_пароля,Входы' -and 'Съемные_носители' -in $names -and 'Изменения_ПО' -in $names -and 'Учетные_записи' -in $names) 'v10 Excel sheet order'
-        Assert-True ($plan[0].Freeze -eq 1 -and $plan[0].PriorityColumn -eq 2 -and $plan[0].Types[2] -eq 1 -and $plan[3].Freeze -eq 5) 'v10 Excel plan for hosts and Sigma'
+        Assert-True (($names[0..7] -join ',') -eq 'Сводка,Нарушения,Цепочки,Правила,Инциденты,Приоритетные,Подбор_пароля,Входы' -and 'Съемные_носители' -in $names -and 'Sigma' -notin $names -and 'Изменения_ПО' -notin $names) 'v10 Excel sheet order'
+        $groupIndex=[array]::IndexOf([string[]]$plan[0].Headers,'Съемные носители')
+        Assert-True ($plan[0].Freeze -eq 1 -and $plan[0].Types[$groupIndex] -eq 1 -and $plan[1].Kind -eq 'Level' -and $plan[1].PriorityColumn -eq 1 -and $plan[1].Freeze -eq 2) 'v10 Excel plan: numeric summary, violations colored by level'
+        $findPlan=@($plan | Where-Object { $_.Kind -eq 'Findings' })[0]
+        Assert-True ('Что проверить' -notin $findPlan.Headers -and 'SHA256 XML события' -notin $findPlan.Headers -and 'Данные события' -in $findPlan.Headers -and $findPlan.Types.Count -eq 46 -and $findPlan.Headers.Count -lt 20 -and @($findPlan.Types | Where-Object { $_ -eq 9 }).Count -eq (46-$findPlan.Headers.Count)) 'v10 Excel plan: findings without technical and advice columns'
         New-FallbackOverview $e2e (Join-Path $e2e 'overview.csv')
         $overview=@(Import-Csv -LiteralPath (Join-Path $e2e 'overview.csv') -Delimiter $Delimiter -Encoding UTF8)
-        Assert-True ($overview[0].'Тип строки' -eq 'Хост' -and @($overview | Where-Object { $_.'Тип строки' -eq 'Sigma' }).Count -eq $alerts.Count) 'v10 CSV fallback: hosts first, Sigma rows included'
+        Assert-True ($overview[0].'Тип строки' -eq 'Хост' -and @($overview | Where-Object { $_.'Тип строки' -eq 'Цепочка' }).Count -eq $chains.Count) 'v10 CSV fallback: hosts first, chains included'
     } finally {
         foreach ($k in $saved.Keys) { Set-Variable -Scope Script -Name $k -Value $saved[$k] }
         foreach ($w in @($script:Writers)) { try { $w.Dispose() } catch { } }
@@ -7845,7 +9369,7 @@ Write-Host ('Режим обработки: '+$(if($script:Engine){'C# (ском
 $runStatus='Running'; $files=@(); $processed=0; $warningFiles=0; $failedFiles=0; $processingWarnings=0; $correlationErrors=0; $fatalError=$null
 $metaPath=Join-Path $script:RunPath 'Run.json'
 $metadata=[ordered]@{ScriptVersion=$script:Version;StartedUtc=$started.ToString('o');FinishedUtc=$null;Status='Running';InputPath=$inputItem.FullName;OutputPath=$outputRoot;
-    PowerShell=$PSVersionTable.PSVersion.ToString();Parameters=[ordered]@{FailureThreshold=$FailureThreshold;WindowMinutes=$WindowMinutes;SprayUserThreshold=$SprayUserThreshold;MaxRdpHours=$MaxRdpHours;RowsPerCsv=$RowsPerCsv;Delimiter=[string]$Delimiter;IncludeNoise=[bool]$IncludeNoise;IncludeAllErrors=[bool]$IncludeAllErrors;MaxEventId=$MaxEventId;StartTimeUtc=$(if($script:HasStart){$StartTime.ToUniversalTime().ToString('o')}else{''});EndTimeUtc=$(if($script:HasEnd){$EndTime.ToUniversalTime().ToString('o')}else{''});IncludeMessages=[bool]$script:FormatMessages;SkipMessages=[bool]$SkipMessages;IncludeNetworkLogons=[bool]$IncludeNetworkLogons;DeepScriptScan=[bool]$DeepScriptScan;IncludeProcessCreation=[bool]$IncludeProcessCreation;HashFiles=[bool]$HashFiles;SkipCorrelation=[bool]$SkipCorrelation;SkipTriage=[bool]$SkipTriage;TriageWindowMinutes=$TriageWindowMinutes;NoExcel=[bool]$NoExcel;KeepTechnicalFiles=[bool]$KeepTechnicalFiles;IncludeAllAntivirusEvents=[bool]$IncludeAllAntivirusEvents;ExtraAvFilePattern=$ExtraAvFilePattern;SigmaRulesPath=(@($SigmaRulesPath | Where-Object { $_ }) -join ' | ');NoSigma=[bool]$NoSigma;NoCompiledEngine=[bool]$NoCompiledEngine;IncidentGapHours=$IncidentGapHours};EngineMode=$script:EngineMode;EngineNote=$script:EngineNote;SigmaRules=0;SigmaCorrelations=0;SigmaSkipped=0;SigmaAlerts=0;FilesDiscovered=0;FilesProcessed=0;WarningFiles=0;FailedOrPartialFiles=0;Findings=0;RdpRows=0;AuthBursts=0;Issues=0;ProcessingWarnings=0;CorrelationErrors=0}
+    PowerShell=$PSVersionTable.PSVersion.ToString();Parameters=[ordered]@{FailureThreshold=$FailureThreshold;WindowMinutes=$WindowMinutes;SprayUserThreshold=$SprayUserThreshold;MaxRdpHours=$MaxRdpHours;RowsPerCsv=$RowsPerCsv;Delimiter=[string]$Delimiter;IncludeNoise=[bool]$IncludeNoise;IncludeAllErrors=[bool]$IncludeAllErrors;MaxEventId=$MaxEventId;StartTimeUtc=$(if($script:HasStart){$StartTime.ToUniversalTime().ToString('o')}else{''});EndTimeUtc=$(if($script:HasEnd){$EndTime.ToUniversalTime().ToString('o')}else{''});IncludeMessages=[bool]$script:FormatMessages;SkipMessages=[bool]$SkipMessages;IncludeNetworkLogons=[bool]$IncludeNetworkLogons;DeepScriptScan=[bool]$DeepScriptScan;IncludeProcessCreation=[bool]$IncludeProcessCreation;HashFiles=[bool]$HashFiles;SkipCorrelation=[bool]$SkipCorrelation;SkipTriage=[bool]$SkipTriage;TriageWindowMinutes=$TriageWindowMinutes;NoExcel=[bool]$NoExcel;KeepTechnicalFiles=[bool]$KeepTechnicalFiles;IncludeAllAntivirusEvents=[bool]$IncludeAllAntivirusEvents;ExtraAvFilePattern=$ExtraAvFilePattern;SigmaRulesPath=(@($SigmaRulesPath | Where-Object { $_ }) -join ' | ');NoSigma=[bool]$NoSigma;NoCompiledEngine=[bool]$NoCompiledEngine;AttackTriage=[bool]$AttackTriage;IncidentGapHours=$IncidentGapHours};EngineMode=$script:EngineMode;EngineNote=$script:EngineNote;SigmaRules=0;SigmaCorrelations=0;SigmaSkipped=0;SigmaAlerts=0;Violations=0;FilesDiscovered=0;FilesProcessed=0;WarningFiles=0;FailedOrPartialFiles=0;Findings=0;RdpRows=0;AuthBursts=0;Issues=0;ProcessingWarnings=0;CorrelationErrors=0}
 [IO.File]::WriteAllText($metaPath,($metadata|ConvertTo-Json -Depth 6),$script:Utf8)
 try {
     $discoveryErrors=@()
@@ -8112,16 +9636,21 @@ try {
         try { $script:SigmaAlertCount=$script:Sigma.Finish($sigmaWriter,[string]$Delimiter) }
         catch { $correlationErrors++; Log-Issue 'Sigma' $script:RunPath '' ('Корреляции Sigma не выполнены: '+$_.Exception.Message) }
         finally { Close-Writer $sigmaWriter }
+        $violationWriter=New-Writer (Join-Path $script:RunPath 'Violations.csv')
+        try { $script:ViolationCount=$script:Sigma.WriteViolations($violationWriter,[string]$Delimiter) }
+        catch { $correlationErrors++; Log-Issue 'Sigma' $script:RunPath '' ('Лист Нарушения не сформирован: '+$_.Exception.Message) }
+        finally { Close-Writer $violationWriter }
         foreach ($problem in @($script:Sigma.Problems | Select-Object -Skip $script:SigmaProblemsLogged)) { Log-Issue 'Sigma' '' '' $problem }
-        Write-Host ('Sigma: срабатываний {0}; {1:N1} сек.' -f $script:SigmaAlertCount,$phaseTimer.Elapsed.TotalSeconds)
+        Write-Host ('Sigma: нарушений (строк) {0}, цепочек и сводных срабатываний {1}; {2:N1} сек.' -f $script:ViolationCount,$script:SigmaAlertCount,$phaseTimer.Elapsed.TotalSeconds)
     }
-    if (-not $SkipTriage) {
-        $phaseTimer=[Diagnostics.Stopwatch]::StartNew()
-        Write-Host 'Формирование листов Приоритетные и Качество_выгрузки...'
-        if ($script:FindingWriter) { $script:FindingWriter.Flush() }
-        if ($script:TriageWriter) { $script:TriageWriter.Flush() }
-        if ($script:Engine) { $script:Engine.Flush() }
-        $inventoryWriter.Flush(); $script:ErrorWriter.Flush()
+    $phaseTimer=[Diagnostics.Stopwatch]::StartNew()
+    Write-Host 'Листы Сводка, Правила, Цепочки, Съемные_носители, Качество_выгрузки...'
+    if ($script:FindingWriter) { $script:FindingWriter.Flush() }
+    if ($script:TriageWriter) { $script:TriageWriter.Flush() }
+    if ($script:Engine) { $script:Engine.Flush() }
+    $inventoryWriter.Flush(); $script:ErrorWriter.Flush()
+    # Heuristic attack triage (Инциденты, Приоритетные): only on request.
+    if ($AttackTriage -and -not $SkipTriage) {
         try {
             Build-Triage $script:RunPath
             if ($script:TriageHasErrors) { $correlationErrors++ }
@@ -8138,23 +9667,23 @@ try {
             }
             Write-Warning 'Приоритизация выполнена с ограничениями. Лист Приоритетные сохранен; подробность есть на листе Ошибки.'
         }
-        try { Build-LogCoverage $script:RunPath }
-        catch {
-            $correlationErrors++
-            Log-Issue 'Triage' $script:RunPath '' ('Не сформирован лист Качество_выгрузки: '+$_.Exception.Message)
-            $coverageFile=Join-Path $script:RunPath 'Coverage.csv'
-            if (Test-Path -LiteralPath $coverageFile) { Remove-Item -LiteralPath $coverageFile -Force }
-            Write-Warning 'Лист Качество_выгрузки не сформирован; базовые отчеты сохранены.'
-        }
-        Write-Host ('Приоритетные и качество выгрузки: {0:N1} сек.' -f $phaseTimer.Elapsed.TotalSeconds)
+    } elseif (-not $AttackTriage) {
+        # Password-guessing windows feed only the attack triage; the Sigma chains cover them.
+        $burstPath=Join-Path $script:RunPath 'AuthBursts.csv'
+        Close-Writer $script:BurstWriter; $script:BurstWriter=$null
+        if (Test-Path -LiteralPath $burstPath) { Remove-Item -LiteralPath $burstPath -Force }
     }
-    $phaseTimer=[Diagnostics.Stopwatch]::StartNew()
-    Write-Host 'Листы Хосты, Съемные_носители, Изменения_ПО, Учетные_записи...'
-    if ($script:Engine) { $script:Engine.Flush() }
-    if ($script:TriageWriter) { $script:TriageWriter.Flush() }
-    $sheetFailures=Build-AuditSheets $script:RunPath $logonRows
-    if ($sheetFailures -gt 0) { $correlationErrors++; Write-Warning 'Часть дополнительных листов не сформирована; подробности на листе Ошибки.' }
-    Write-Host ('Дополнительные листы: {0:N1} сек.' -f $phaseTimer.Elapsed.TotalSeconds)
+    try { Build-LogCoverage $script:RunPath }
+    catch {
+        $correlationErrors++
+        Log-Issue 'Triage' $script:RunPath '' ('Не сформирован лист Качество_выгрузки: '+$_.Exception.Message)
+        $coverageFile=Join-Path $script:RunPath 'Coverage.csv'
+        if (Test-Path -LiteralPath $coverageFile) { Remove-Item -LiteralPath $coverageFile -Force }
+        Write-Warning 'Лист Качество_выгрузки не сформирован; базовые отчеты сохранены.'
+    }
+    $sheetFailures=Build-AuditSheets $script:RunPath $logonRows $script:Sigma
+    if ($sheetFailures -gt 0) { $correlationErrors++; Write-Warning 'Часть листов не сформирована; подробности на листе Ошибки.' }
+    Write-Host ('Листы отчета: {0:N1} сек.' -f $phaseTimer.Elapsed.TotalSeconds)
     $runStatus='Completed'
     if ($failedFiles -gt 0 -or $discoveryErrors.Count -gt 0 -or $correlationErrors -gt 0) { $runStatus='CompletedWithErrors' }
     elseif ($warningFiles -gt 0 -or $script:WarningCount -gt 0 -or $processingWarnings -gt 0) { $runStatus='CompletedWithWarnings' }
@@ -8169,7 +9698,7 @@ try {
     $metadata.Issues=$script:IssueCount; $metadata.ProcessingWarnings=($script:WarningCount+$processingWarnings); $metadata.CorrelationErrors=$correlationErrors
     if ($script:Engine) { try { $script:FindingCount=$script:Engine.FindingCount; $script:Engine.Dispose() } catch { } }
     $metadata.Findings=$script:FindingCount
-    $metadata.EngineMode=$script:EngineMode; $metadata.EngineNote=$script:EngineNote; $metadata.SigmaAlerts=$script:SigmaAlertCount
+    $metadata.EngineMode=$script:EngineMode; $metadata.EngineNote=$script:EngineNote; $metadata.SigmaAlerts=$script:SigmaAlertCount; $metadata.Violations=$script:ViolationCount
     if ($script:Sigma) { $metadata.SigmaRules=$script:Sigma.RuleCount; $metadata.SigmaCorrelations=$script:Sigma.CorrelationCount; $metadata.SigmaSkipped=$script:Sigma.Skipped }
     foreach ($w in @($script:Writers)) { try { $w.Dispose() } catch { } }
     $script:Writers.Clear()
