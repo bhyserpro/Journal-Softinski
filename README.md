@@ -1,6 +1,6 @@
 # EVTX Audit v11 — проверка выгрузок журналов Windows на объектах КИИ / АСУ ТП
 
-Скрипт `Audit-Evtx-11.2.ps1` (в имени файла — версия) прогоняет выгруженные журналы `.evtx` через набор правил
+Скрипт `Audit-Evtx-11.3.ps1` (в имени файла — версия) прогоняет выгруженные журналы `.evtx` через набор правил
 **Sigma** — как программа Chainsaw, но на PowerShell и встроенном .NET (Windows
 PowerShell 5.1, без установки ПО). Каждое событие, попавшее под правило, становится
 строкой листа **«Нарушения»** с уровнем, временем, компьютером, пользователем и
@@ -19,7 +19,7 @@ PowerShell 5.1, без установки ПО). Каждое событие, п
 ```powershell
 cd "C:\Users\VATukkaev\Desktop\audit script";
 $ErrorActionPreference = 'Stop';
-$EvtxRunner = [scriptblock]::Create((Get-Content -LiteralPath '.\Audit-Evtx-11.2.ps1' -Raw -Encoding UTF8 -ErrorAction Stop));
+$EvtxRunner = [scriptblock]::Create((Get-Content -LiteralPath '.\Audit-Evtx-11.3.ps1' -Raw -Encoding UTF8 -ErrorAction Stop));
 try {
     & $EvtxRunner -SelfTest;
     $Logs = Read-Host 'Вставьте общую папку с логами';
@@ -39,7 +39,7 @@ try {
 Команды заканчиваются `;` и не содержат пустых строк: при вставке в консоль PowerShell
 переносы строк иногда теряются, и без `;` соседние строки склеиваются в одну команду.
 
-Успешный SelfTest заканчивается строкой `ALL SELFTESTS PASSED — version 11.2.0`.
+Успешный SelfTest заканчивается строкой `ALL SELFTESTS PASSED — version 11.3.0`.
 Удобнее всего класть выгрузку каждого компьютера в свою подпапку (можно целиком
 `C:\Windows\System32\winevt\Logs`): цепочки событий строятся внутри одной папки и
 одного компьютера.
@@ -283,6 +283,8 @@ SelfTest проходит в PowerShell 7.4 на Linux с параметрами
 
 ## История
 
+- **v11.3** — исправлен SelfTest Касперского в Windows PowerShell 5.1 (StrictMode: `.Count` у
+  одиночного объекта).
 - **v11.2** — Антивирус Касперского: 22 правила по тексту событий (KES, KSWS, KICS for
   Nodes) и кодам KES 11–12, удаление антивируса, служба, Центр безопасности Windows; цепочки
   «многократное обнаружение угроз», «выключение защиты → подключение носителя»; вероятный

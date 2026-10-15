@@ -46,13 +46,13 @@ rules/windows/builtin). Поддерживаемое подмножество о
 Только самопроверка (журналы не читаются).
 
 .EXAMPLE
-& .\Audit-Evtx-11.2.ps1 -SelfTest
+& .\Audit-Evtx-11.3.ps1 -SelfTest
 
 .EXAMPLE
-& .\Audit-Evtx-11.2.ps1 -InputPath D:\Выгрузки -OutputPath D:\Отчеты -StartTime '2026-09-01'
+& .\Audit-Evtx-11.3.ps1 -InputPath D:\Выгрузки -OutputPath D:\Отчеты -StartTime '2026-09-01'
 
 .EXAMPLE
-& .\Audit-Evtx-11.2.ps1 -InputPath D:\Выгрузки -SigmaRulesPath D:\sigma\rules\windows\builtin
+& .\Audit-Evtx-11.3.ps1 -InputPath D:\Выгрузки -SigmaRulesPath D:\sigma\rules\windows\builtin
 
 .NOTES
 См. README.md: семантика, ограничения и статус проверки.
@@ -97,7 +97,7 @@ param(
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$script:Version = '11.2.0'
+$script:Version = '11.3.0'
 $script:Utf8 = New-Object System.Text.UTF8Encoding($true)
 $script:Invariant = [Globalization.CultureInfo]::InvariantCulture
 # Time zone for the "(местное)" columns: -DisplayTimeZone (Windows id, e.g. 'Russian Standard Time') or this computer's zone.
@@ -1677,7 +1677,7 @@ namespace __NS__
 
     public sealed class Engine : IDisposable
     {
-        public const string Version = "11.2.0";
+        public const string Version = "11.3.0";
         // Configuration (set by PowerShell before Open()).
         public bool IncludeNoise, IncludeNetworkLogons, DeepScriptScan, IncludeProcessCreation, IncludeAllAntivirusEvents, GenericErrors, SkipCorrelation, KeepEvidence;
         public int MaxEventId = 10000, FailureThreshold = 10, WindowMinutes = 10, SprayUserThreshold = 5, RowsPerCsv = 500000;
@@ -10627,14 +10627,14 @@ function Test-V112Kaspersky {
             $det[0].'Пользователь' -like 'вероятно WS01\operator*' -and $det[0].'Детали' -notlike '*Kaspersky Endpoint Security*') 'Kaspersky: detections from Russian text and from bare KES 12 parameters (ID 302)'
         $nc=@(& $row 'Kaspersky: угроза не устранена*')
         Assert-True ($nc.Count -eq 1 -and $nc[0].'Уровень' -eq 'Критический' -and $nc[0].'Детали' -like '*Объект: E:\doc.scr*') 'Kaspersky: not disinfected is critical'
-        Assert-True ((& $row 'Kaspersky: объект обезврежен*').Count -eq 1 -and (& $row 'Kaspersky: объект обезврежен*')[0].'Уровень' -eq 'Низкий') 'Kaspersky: object deleted is low'
+        Assert-True (@(& $row 'Kaspersky: объект обезврежен*').Count -eq 1 -and @(& $row 'Kaspersky: объект обезврежен*')[0].'Уровень' -eq 'Низкий') 'Kaspersky: object deleted is low'
         $dev=@(& $row 'Kaspersky: доступ к устройству заблокирован*')
         Assert-True ($dev.Count -eq 1 -and $dev[0].'Группа' -eq 'Съемные носители' -and $dev[0].'Детали' -like '*Устройство: Съемный диск*Правило: Запрет съемных дисков*' -and $dev[0].'Пользователь' -like 'вероятно WS01\operator*') 'Kaspersky: device blocked, probable user'
         $legal=@(& $row 'Kaspersky: обнаружена легальная программа*')
         Assert-True ($legal.Count -eq 1 -and $legal[0].'Нарушение' -notlike '*вредоносный объект*' -and $legal[0].'Пользователь' -eq 'WS01\operator' -and $legal[0].'Детали' -like '*not-a-virus:RemoteAdmin*radmin.exe*') 'Kaspersky: riskware is not reported as malware'
-        Assert-True ((& $row 'Kaspersky: попытка вмешательства*')[0].'Детали' -like '*taskkill.exe*' -and (& $row 'Kaspersky: запуск программы запрещен*')[0].'Детали' -like '*Программа: game.exe*') 'Kaspersky: self-defense and application control'
+        Assert-True (@(& $row 'Kaspersky: попытка вмешательства*')[0].'Детали' -like '*taskkill.exe*' -and @(& $row 'Kaspersky: запуск программы запрещен*')[0].'Детали' -like '*Программа: game.exe*') 'Kaspersky: self-defense and application control'
         $svc=@(& $row 'Служба антивируса Касперского*')
-        Assert-True ((& $row '*Удален антивирус Касперского*').Count -eq 1 -and $svc.Count -eq 1 -and $svc[0].'Пользователь' -eq 'WS01\operator (S-1-5-21-1-2-3-1100)' -and (& $row 'Антивирус выключен (Центр безопасности Windows)').Count -eq 1) 'Kaspersky: uninstall, service disabled, Security Center (not Defender)'
+        Assert-True (@(& $row '*Удален антивирус Касперского*').Count -eq 1 -and $svc.Count -eq 1 -and $svc[0].'Пользователь' -eq 'WS01\operator (S-1-5-21-1-2-3-1100)' -and @(& $row 'Антивирус выключен (Центр безопасности Windows)').Count -eq 1) 'Kaspersky: uninstall, service disabled, Security Center (not Defender)'
         Assert-True ($viol.Count -eq 16 -and $count -eq 16 -and @($viol | Where-Object { $_.'Детали' -like '*обновлены*' -or $_.'Детали' -like '*Угроз не обнаружено*' -or $_.'Детали' -like '*Задача запущена*' }).Count -eq 0) ('Kaspersky: '+$viol.Count+' violation rows, updates, clean scans and tasks are not violations')
         $titles=@($alerts | ForEach-Object { $_.'Правило' })
         foreach ($expected in @('Многократное обнаружение угроз на компьютере','Выключение защиты → подключение носителя','Обнаружение угрозы после подключения носителя')) { Assert-True ($expected -in $titles) ('Kaspersky chain: '+$expected) }
