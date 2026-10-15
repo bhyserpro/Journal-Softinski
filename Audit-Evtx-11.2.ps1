@@ -46,13 +46,13 @@ rules/windows/builtin). Поддерживаемое подмножество о
 Только самопроверка (журналы не читаются).
 
 .EXAMPLE
-& .\Audit-Evtx-11.1.ps1 -SelfTest
+& .\Audit-Evtx-11.2.ps1 -SelfTest
 
 .EXAMPLE
-& .\Audit-Evtx-11.1.ps1 -InputPath D:\Выгрузки -OutputPath D:\Отчеты -StartTime '2026-09-01'
+& .\Audit-Evtx-11.2.ps1 -InputPath D:\Выгрузки -OutputPath D:\Отчеты -StartTime '2026-09-01'
 
 .EXAMPLE
-& .\Audit-Evtx-11.1.ps1 -InputPath D:\Выгрузки -SigmaRulesPath D:\sigma\rules\windows\builtin
+& .\Audit-Evtx-11.2.ps1 -InputPath D:\Выгрузки -SigmaRulesPath D:\sigma\rules\windows\builtin
 
 .NOTES
 См. README.md: семантика, ограничения и статус проверки.
@@ -97,7 +97,7 @@ param(
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$script:Version = '11.1.0'
+$script:Version = '11.2.0'
 $script:Utf8 = New-Object System.Text.UTF8Encoding($true)
 $script:Invariant = [Globalization.CultureInfo]::InvariantCulture
 # Time zone for the "(местное)" columns: -DisplayTimeZone (Windows id, e.g. 'Russian Standard Time') or this computer's zone.
@@ -713,6 +713,12 @@ function Match-Event($e, [bool]$VendorFile) {
     }
     return $r
 }
+# Kaspersky Endpoint Security, Kaspersky Security for Windows Server, KICS for Nodes,
+# Endpoint Agent. Provider names differ by product and version; unknown ones are caught
+# by the KES Windows event IDs below and by the text "Kaspersky" in the event.
+$script:KasperskyChannels=@('Kaspersky Event Log','Kaspersky Security','Kaspersky Endpoint Security','Kaspersky-Security-Soyuz/Product','Kaspersky Industrial CyberSecurity')
+$script:KasperskyProviders=@('avp','KES','Kaspersky Endpoint Security','Kaspersky Endpoint Security for Windows','Kaspersky Security','Kaspersky Security Service','KSCM8','kavfs','KSDE','klnagent','Kaspersky Security Center','Kaspersky Security Center Network Agent','Kaspersky Industrial CyberSecurity','Kaspersky Industrial CyberSecurity for Nodes','KICS')
+$script:KasperskyIds=@(206,207,209,210,211,212,213,214,231,302,303,306,307,312,362,363,651,802,2200)
 function Build-Query([string]$Path, [bool]$VendorFile, [bool]$SkipSigma=$false) {
     $queryKey=([string]$VendorFile)+'|'+([string]$SkipSigma)+'|'+$IncludeNoise+'|'+$IncludeNetworkLogons+'|'+$DeepScriptScan+'|'+$IncludeProcessCreation+'|'+$script:GenericErrors+'|'+$MaxEventId+'|'+$script:StartTicks+'|'+$script:EndTicks+'|'+$script:SigmaSelectors.Count
     if ($script:QueryCache.ContainsKey($queryKey)) { return $script:QueryCache[$queryKey] }
@@ -720,7 +726,8 @@ function Build-Query([string]$Path, [bool]$VendorFile, [bool]$SkipSigma=$false) 
     # records before ToXml/PowerShell. Rule selectors list explicit IDs (already
     # <= MaxEventId); only the wildcard selectors need an explicit EventID limit.
     # Terms are kept few: a rejected query falls back to a much slower full scan.
-    $common='EventID<='+$MaxEventId
+    # Third-party AV logs keep their own Event ID ranges (Kaspersky Event Log: above 10000).
+    $common=$(if ($VendorFile) { 'EventID>=0' } else { 'EventID<='+$MaxEventId })
     $time=''
     if ($script:HasStart) { $time+=" and TimeCreated[@SystemTime>='"+([DateTime]::new($script:StartTicks,[DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ',$script:Invariant))+"']" }
     if ($script:HasEnd) { $time+=" and TimeCreated[@SystemTime<='"+([DateTime]::new($script:EndTicks,[DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ',$script:Invariant))+"']" }
@@ -778,6 +785,16 @@ function Build-Query([string]$Path, [bool]$VendorFile, [bool]$SkipSigma=$false) 
         if ($SkipSigma) { break }
         $selector=$sigmaSelector.Replace('{TIME}',$time)
         if (-not $selectors.Contains($selector)) { $selectors.Add($selector) }
+    }
+    if (-not $SkipSigma -and $script:SigmaSelectors.Count -gt 0) {
+        # Kaspersky rules match the event text, not IDs: read the Kaspersky channels and
+        # providers whole, and KES 11-12 codes from Application whatever the provider name.
+        foreach ($name in $script:KasperskyChannels) { $selectors.Add("*[System[Channel='$name'$time]]") }
+        foreach ($name in $script:KasperskyProviders) { $selectors.Add("*[System[Provider[@Name='$name']$time]]") }
+        for ($i=0; $i -lt $script:KasperskyIds.Count; $i+=8) {
+            $last=[Math]::Min($i+7,$script:KasperskyIds.Count-1)
+            $selectors.Add("*[System[Channel='Application' and ("+((@($script:KasperskyIds[$i..$last]) | ForEach-Object { 'EventID='+$_ }) -join ' or ')+")$time]]")
+        }
     }
     }
     # The source file is supplied through EventLogQuery.Path with PathType=FilePath.
@@ -1660,7 +1677,7 @@ namespace __NS__
 
     public sealed class Engine : IDisposable
     {
-        public const string Version = "11.1.0";
+        public const string Version = "11.2.0";
         // Configuration (set by PowerShell before Open()).
         public bool IncludeNoise, IncludeNetworkLogons, DeepScriptScan, IncludeProcessCreation, IncludeAllAntivirusEvents, GenericErrors, SkipCorrelation, KeepEvidence;
         public int MaxEventId = 10000, FailureThreshold = 10, WindowMinutes = 10, SprayUserThreshold = 5, RowsPerCsv = 500000;
@@ -2601,15 +2618,146 @@ namespace __NS__
         }
     }
 
+    // ---------------------------------------------------------------- Kaspersky
+    // Kaspersky products (KES, KSWS, KICS for Nodes) write the event as text lines
+    // "Label: value" (Russian or English) in one insertion string; KES 11-12 in the
+    // Application log may instead write bare parameters (SHA256, object name). The
+    // pseudo-fields Kaspersky.* expose both forms; they are null for other events.
+    internal static class Kaspersky
+    {
+        static readonly Dictionary<string, bool> Providers = NewSet("avp", "kes", "kavfs", "kavfswp", "kscm8", "ksde", "klnagent", "kics", "kicsfn", "kav", "kis", "kts");
+        static readonly Dictionary<string, bool> NotKaspersky = NewSet("MsiInstaller", "SecurityCenter", "Application Error", "Application Hang", "Windows Error Reporting",
+            "Service Control Manager", "Desktop Window Manager", "RestartManager", "Wininit", "Winlogon", "User32", "EventLog", "VSS", "ESENT");
+        // Label (lower case, '\' separators) -> field.
+        static readonly Dictionary<string, string> Labels = BuildLabels();
+        static readonly Regex Sha256 = new Regex(@"^[0-9A-Fa-f]{64}$", RegexOptions.CultureInvariant);
+        static readonly Regex Spaces = new Regex(@"\s+", RegexOptions.CultureInvariant);
+        static readonly Regex Role = new Regex(@"\s*\([^()]*\)\s*$", RegexOptions.CultureInvariant);
+        static Dictionary<string, bool> NewSet(params string[] names)
+        {
+            Dictionary<string, bool> d = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            foreach (string n in names) d[n] = true;
+            return d;
+        }
+        static Dictionary<string, string> BuildLabels()
+        {
+            Dictionary<string, string> d = new Dictionary<string, string>(StringComparer.Ordinal);
+            string[][] map = {
+                new string[] { "Event", "тип события", "event type", "событие", "event" },
+                new string[] { "Component", "компонент", "component", "задача", "task", "название задачи", "task name" },
+                new string[] { "Result", "результат\\описание", "result\\description", "результат", "result", "действие", "action", "статус", "status" },
+                new string[] { "ThreatType", "результат\\тип", "result\\type", "тип угрозы", "threat type", "тип обнаруженного объекта" },
+                new string[] { "Threat", "результат\\название", "result\\name", "название угрозы", "threat name", "угроза", "threat", "обнаружено", "detected", "вердикт", "verdict", "название атаки", "attack name", "атака\\название", "attack\\name" },
+                new string[] { "ObjectPath", "объект\\путь", "object\\path", "путь", "path", "путь к объекту", "object path" },
+                new string[] { "ObjectName", "объект\\название", "object\\name", "объект", "object", "имя объекта", "object name", "файл", "file", "url", "веб-адрес", "web address", "адрес", "address", "ссылка", "link" },
+                new string[] { "Hash", "объект\\sha256", "object\\sha256", "sha256", "хеш", "hash", "md5", "объект\\md5", "object\\md5" },
+                new string[] { "User", "пользователь", "user", "инициатор", "initiator", "имя пользователя", "user name", "учетная запись", "account" },
+                new string[] { "Application", "приложение\\название", "application\\name", "приложение", "application", "программа", "процесс", "process", "имя процесса", "process name" },
+                new string[] { "ApplicationPath", "приложение\\путь", "application\\path", "путь к программе", "путь к процессу", "process path" },
+                new string[] { "Reason", "причина", "reason", "описание", "description", "правило", "rule", "категория", "category" },
+                new string[] { "Device", "устройство", "device", "тип устройства", "device type", "идентификатор устройства", "device id", "название устройства", "device name", "модель", "model", "шина", "bus" },
+                new string[] { "Remote", "атакующий", "attacker", "атакующий компьютер", "attacking computer", "ip-адрес атакующего", "ip-адрес", "ip address", "удаленный адрес", "remote address", "источник", "source" }
+            };
+            foreach (string[] row in map) for (int i = 1; i < row.Length; i++) if (!d.ContainsKey(row[i])) d[row[i]] = row[0];
+            return d;
+        }
+        static int CountNonEmpty(EvtEvent e)
+        {
+            int n = 0;
+            foreach (string v in e.Values) if (!string.IsNullOrEmpty(v)) n++;
+            return n;
+        }
+        public static bool Is(EvtEvent e)
+        {
+            if (e.Provider.IndexOf("kaspersky", StringComparison.OrdinalIgnoreCase) >= 0 || e.Channel.IndexOf("kaspersky", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (Providers.ContainsKey(e.Provider) || e.Provider.StartsWith("KES.", StringComparison.OrdinalIgnoreCase)) return true;
+            // Unknown provider names in the Application log: the text names the product.
+            if (!U.EqI(e.Channel, "Application") || NotKaspersky.ContainsKey(e.Provider) || e.Provider.StartsWith("Microsoft", StringComparison.OrdinalIgnoreCase)) return false;
+            return e.Xml.IndexOf("Kaspersky", StringComparison.OrdinalIgnoreCase) >= 0 || e.Xml.IndexOf("Касперск", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+        // null for events of other products.
+        public static Dictionary<string, string> Fields(EvtEvent e)
+        {
+            if (!Is(e)) return null;
+            Dictionary<string, string> f = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            StringBuilder text = new StringBuilder();
+            List<string> bare = new List<string>();
+            for (int i = 0; i < e.Values.Count; i++)
+            {
+                string v = e.Values[i] ?? "";
+                if (v.Length == 0) continue;
+                if (text.Length > 0) text.Append('\n');
+                text.Append(v);
+                bool labelled = false;
+                foreach (string raw in v.Split('\n'))
+                {
+                    string line = raw.Trim();
+                    int colon = line.IndexOf(':');
+                    if (colon <= 0 || colon > 60 || colon == line.Length - 1 && line.Length < 3) continue;
+                    // "C:\..." is a value, not a label.
+                    if (colon == 1 && line.Length > 2 && line[2] == '\\') continue;
+                    string label = Spaces.Replace(line.Substring(0, colon).Replace('/', '\\').Replace(" \\", "\\").Replace("\\ ", "\\"), " ").Trim().TrimEnd('.').ToLowerInvariant();
+                    string value = line.Substring(colon + 1).Trim();
+                    string field;
+                    if (!Labels.TryGetValue(label, out field)) continue;
+                    labelled = true;
+                    if (value.Length == 0 || f.ContainsKey(field)) continue;
+                    f[field] = value;
+                }
+                if (!labelled) bare.Add(v.Trim());
+            }
+            if (e.Message.Length > 0) { if (text.Length > 0) text.Append('\n'); text.Append(e.Message); }
+            f["Text"] = text.ToString();
+            bool typed = f.ContainsKey("Event");
+            // Bare parameters of KES 11-12 (Application log): SHA256 and object name first.
+            if (!typed && bare.Count > 0)
+            {
+                int k = 0;
+                if (Sha256.IsMatch(bare[0])) { if (!f.ContainsKey("Hash")) f["Hash"] = bare[0]; k = 1; }
+                if (k < bare.Count && !f.ContainsKey("ObjectName")) f["ObjectName"] = bare[k];
+            }
+            string path, name;
+            f.TryGetValue("ObjectPath", out path); f.TryGetValue("ObjectName", out name);
+            path = path ?? ""; name = name ?? "";
+            if (path.Length > 0 && name.Length > 0 && !path.EndsWith(name, StringComparison.OrdinalIgnoreCase))
+                f["Object"] = path.EndsWith("\\") || path.EndsWith("/") ? path + name : path + "\\" + name;
+            else f["Object"] = path.Length > 0 ? path : name;
+            string app, appPath;
+            f.TryGetValue("Application", out app); f.TryGetValue("ApplicationPath", out appPath);
+            if ((app ?? "").Length == 0 && (appPath ?? "").Length > 0) f["Application"] = appPath;
+            // "Application\Name" of KES events is usually the antivirus itself.
+            if (f.TryGetValue("Application", out app) && (app.IndexOf("Kaspersky", StringComparison.OrdinalIgnoreCase) >= 0 || app.IndexOf("Касперск", StringComparison.OrdinalIgnoreCase) >= 0))
+                f["Application"] = (appPath ?? "").IndexOf("Kaspersky", StringComparison.OrdinalIgnoreCase) >= 0 ? "" : (appPath ?? "");
+            string user;
+            if (f.TryGetValue("User", out user)) f["User"] = Role.Replace(user, "").Trim();
+            // Event type line, otherwise the whole text (other products and versions).
+            // Summary is what the report shows: nothing for bare parameters.
+            if (!typed) f["Event"] = f["Text"];
+            f["Summary"] = typed ? f["Event"] : (bare.Count > 0 && bare.Count == CountNonEmpty(e) && bare.Count <= 3 ? "" : f["Text"]);
+            // Event ID of KES 11-12 in the Application log, only without an event type line.
+            f["Id"] = !typed && U.EqI(e.Channel, "Application") ? e.Id.ToString(CultureInfo.InvariantCulture) : "";
+            return f;
+        }
+    }
+
     // ---------------------------------------------------------------- detection tree
     sealed class SCtx
     {
         public EvtEvent E;
         public Dictionary<string, string> FieldMap;
+        EvtEvent kasperskyFor;
+        Dictionary<string, string> kaspersky;
         public string Field(string name)
         {
             string n = name, mapped;
             if (FieldMap != null && FieldMap.TryGetValue(n, out mapped)) n = mapped;
+            if (n.StartsWith("Kaspersky.", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!object.ReferenceEquals(kasperskyFor, E)) { kasperskyFor = E; kaspersky = Kaspersky.Fields(E); }
+                if (kaspersky == null) return null;
+                string kv;
+                return kaspersky.TryGetValue(n.Substring(10), out kv) ? kv : "";
+            }
             switch (n.ToLowerInvariant())
             {
                 case "eventid": return E.Id.ToString(CultureInfo.InvariantCulture);
@@ -3900,12 +4048,18 @@ namespace __NS__
             string sid = e.Get("SubjectUserSid");
             bool machine = e.Get("SubjectUserName").EndsWith("$") || sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20";
             if (e.Subject.Length > 0 && !machine) return e.Subject;
+            // param1-4 of Service Control Manager are service names and start types.
+            bool scm = U.EqI(e.Provider, "Service Control Manager");
             foreach (string f in new string[] { "User", "param7", "Detection User", "UserName", "Param3" })
             {
+                if (scm && f.StartsWith("param", StringComparison.OrdinalIgnoreCase)) continue;
                 string v = e.GetData(f);
                 if (!string.IsNullOrEmpty(v) && v.Trim().Length > 0 && v != "-") return v.Trim();
             }
             if (e.Subject.Length > 0) return e.Subject;
+            Dictionary<string, string> k = Kaspersky.Fields(e);
+            string ku;
+            if (k != null && k.TryGetValue("User", out ku) && ku.Length > 0) return ku;
             return WellKnown(e.SecurityUserId);
         }
         static readonly Dictionary<int, bool> GroupMemberIds = Ids(4728, 4729, 4732, 4733, 4746, 4747, 4751, 4752, 4756, 4757, 4761, 4762);
@@ -4036,7 +4190,7 @@ namespace __NS__
             catch (Exception) { }
             ViolationRow row = new ViolationRow();
             row.Computer = e.Computer; row.Ticks = e.Ticks; row.LastTicks = e.Ticks; row.Seq = seq;
-            row.InferUser = (group == "Съемные носители" || group == "Сеть и периферия") &&
+            row.InferUser = (group == "Съемные носители" || group == "Сеть и периферия" || group == "Средства защиты" || group == "Запуск программ") &&
                 (user.Length == 0 || user.EndsWith("$") || user.StartsWith("NT AUTHORITY", StringComparison.OrdinalIgnoreCase));
             string accountObject = AccountObject(e);
             if (accountObject.Length > 0 && (group == "Учетные записи" || group == "Права и группы"))
@@ -5623,6 +5777,684 @@ detection:
     condition: selection
 level: medium
 ---
+# ---------------------------------------------------------------- Антивирус Касперского
+# KES, Kaspersky Security для Windows Server, KICS for Nodes. Продукты пишут событие
+# текстом «Тип события: …», «Объект\Путь: …» (на русском или английском) — движок
+# разбирает его в поля Kaspersky.* (Event — тип события, а без строки типа — весь
+# текст). KES 11–12 в журнале Application может писать только параметры; тогда
+# правила используют коды событий Windows (Kaspersky.Id — только в этом случае).
+title: 'Kaspersky: угроза не устранена (объект не вылечен, активная угроза)'
+id: 0fd1f208-f5d3-5ac1-8e62-1acd000f7115
+status: experimental
+description: Антивирус обнаружил угрозу, но не смог ее вылечить, удалить или обработать, либо сообщил об активной угрозе, для которой нужно расширенное лечение. ВПО может оставаться на компьютере и работать.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.execution
+    - attack.t1204
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Угроза=Kaspersky.Threat
+    - Объект=Kaspersky.Object
+    - Результат=Kaspersky.Result
+    - Компонент=Kaspersky.Component
+    - SHA256=Kaspersky.Hash
+logsource:
+    product: windows
+detection:
+    by_text:
+        - Kaspersky.Event|re: '(?i)(не\s+(вылечен|удал[её]н|обработан|обезврежен|помещ[её]н)|невозможно\s+(вылечить|удалить|лечение|обработать)|лечение\s+невозможно|ошибк\w*\s+(лечения|удаления|обработки)|not\s+(disinfected|deleted|processed|neutralized|quarantined)|disinfection\s+(is\s+)?impossible|cannot\s+be\s+(disinfected|deleted|processed)|(processing|disinfection|deletion)\s+(error|failed)|активн\w*\s+угроз|active\s+threat|расширенн\w*\s+лечени|advanced\s+disinfection)'
+        - Kaspersky.Result|re: '(?i)(не\s+(вылечен|удал[её]н|обработан|обезврежен|помещ[её]н)|невозможно|ошибк|not\s+(disinfected|deleted|processed|neutralized|quarantined)|impossible|failed|error)'
+    by_id:
+        Kaspersky.Id:
+            - '231'
+            - '312'
+    statistics:
+        Kaspersky.Event|re: '(?i)(не\s+\w+\s*:\s*\d|not\s+\w+\s*:\s*\d)'
+    condition: (by_text or by_id) and not statistics
+falsepositives:
+    - Объект в архиве или на защищенном от записи носителе, который нельзя изменить
+level: critical
+---
+title: 'Kaspersky: обнаружен вредоносный объект'
+id: d294174b-934c-5a2a-a8d8-1a6065ba66fc
+status: experimental
+description: Антивирус Касперского обнаружил вредоносный объект (файл, процесс, скрипт, письмо). На объектах АСУ ТП чаще всего его приносят на съемном носителе или ноутбуке подрядчика. Результат обработки — в отдельном событии (объект удален, вылечен или нет).
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.execution
+    - attack.t1204
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Угроза=Kaspersky.Threat
+    - Тип=Kaspersky.ThreatType
+    - Объект=Kaspersky.Object
+    - Результат=Kaspersky.Result
+    - Компонент=Kaspersky.Component
+    - Процесс=Kaspersky.Application
+    - SHA256=Kaspersky.Hash
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(вредоносн\w*\s+(объект|программ|ПО|код|файл)|malicious\s+(object|software|code|file)|обнаружен\w*\s+(вирус|угроз|заражен\w*|опасн\w*\s+объект|объект)|virus\s+(was\s+)?(found|detected)|threat\s+(was\s+)?detected|infected\s+object|объект\s+заражен|заражен\w*\s+объект|object\s+(is\s+)?infected)'
+    by_id:
+        Kaspersky.Id: '302'
+    nothing_found:
+        Kaspersky.Event|re: '(?i)(не\s+обнаружен|not\s+(found|detected)|no\s+threats)'
+    legal_software:
+        Kaspersky.Threat|startswith: 'not-a-virus'
+    condition: (by_text or by_id) and not nothing_found and not legal_software
+falsepositives:
+    - Тестовый файл EICAR, проверка антивируса администратором
+level: high
+---
+title: 'Kaspersky: обнаружена легальная программа, опасная в руках злоумышленника'
+id: 94f88535-bf51-5a5a-affa-7af4c7f1b3cc
+status: experimental
+description: Средство удаленного администрирования (not-a-virus:RemoteAdmin), утилита для паролей, сетевой сканер и т. п. В сегменте АСУ ТП такие программы без согласования запрещены — часто это установка персоналом TeamViewer, Radmin или подобного.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.command-and-control
+    - attack.t1219
+evtxa_group: Средства защиты
+fstec239: [АВЗ, ОПС]
+fields:
+    - Событие=Kaspersky.Summary
+    - Программа=Kaspersky.Threat
+    - Объект=Kaspersky.Object
+    - Результат=Kaspersky.Result
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(легальн\w*\s+(программ|ПО|приложени|софт)|legitimate\s+(software|application|program)|riskware|рекламн\w*\s+программ|adware)'
+    by_threat:
+        Kaspersky.Threat|startswith: 'not-a-virus'
+    by_id:
+        Kaspersky.Id: '303'
+    condition: by_text or by_threat or by_id
+falsepositives:
+    - Разрешенные регламентом средства администрирования
+level: medium
+---
+title: 'Kaspersky: объект обезврежен (удален, вылечен, помещен в карантин)'
+id: ab87bb52-8d07-55aa-bc43-537ddb4113cf
+status: experimental
+description: Результат обработки обнаруженной угрозы — подтверждает, что объект обезврежен. Ищите рядом строку «обнаружен вредоносный объект» и откуда он пришел.
+author: EVTX Audit
+date: 2026-10-15
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Угроза=Kaspersky.Threat
+    - Объект=Kaspersky.Object
+    - Результат=Kaspersky.Result
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(объект\w*\s+(удал[её]н|вылечен|помещ[её]н|перемещ[её]н|заблокирован)|(помещ[её]н|перемещ[её]н)\w*\s+в\s+(карантин|резервн)|object\s+(was\s+|has\s+been\s+)?(deleted|disinfected|quarantined|moved|blocked)|moved\s+to\s+(quarantine|backup))'
+    by_id:
+        Kaspersky.Id:
+            - '306'
+            - '307'
+    condition: by_text or by_id
+level: low
+---
+title: 'Kaspersky: обнаружена сетевая атака'
+id: 13fc3582-9993-587a-a0fb-26496aaf988e
+status: experimental
+description: Компонент «Защита от сетевых угроз» обнаружил и заблокировал атаку на компьютер (сканирование портов, эксплуатация уязвимостей, подбор). Для изолированного сегмента АСУ ТП — повод выяснить, какой узел атакует.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.initial-access
+    - attack.t1190
+evtxa_group: Признаки атаки
+fstec239: [СОВ, ЗИС]
+fields:
+    - Событие=Kaspersky.Summary
+    - Атака=Kaspersky.Threat
+    - Источник=Kaspersky.Remote
+    - Объект=Kaspersky.Object
+    - Результат=Kaspersky.Result
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(сетев\w*\s+атак|network\s+attack|обнаружен\w*\s+атак|атак\w*\s+(была\s+)?заблокирован|attack\s+(was\s+)?(detected|blocked))'
+    by_id:
+        Kaspersky.Id: '651'
+    condition: by_text or by_id
+falsepositives:
+    - Сетевые сканеры, системы инвентаризации, ошибочные правила защиты
+level: high
+---
+title: 'Kaspersky: обнаружена опасная или фишинговая ссылка'
+id: 01e338a1-f980-5636-b5fb-56a032639168
+status: experimental
+description: Переход по вредоносной или фишинговой ссылке (браузер, почта). На АРМ АСУ ТП выход в интернет обычно запрещен — проверьте, откуда есть доступ.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.initial-access
+    - attack.t1566
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Адрес=Kaspersky.Object
+    - Угроза=Kaspersky.Threat
+    - Результат=Kaspersky.Result
+    - Программа=Kaspersky.Application
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)((опасн|вредоносн|фишинг\w*|заражен)\w*\s+(ссылк|url|веб-адрес|адрес|веб-сайт|сайт|веб-ресурс)|(malicious|dangerous|phishing|infected)\s+(link|url|web\s+address|website|web\s+resource)|фишинг|phishing)'
+    by_id:
+        Kaspersky.Id:
+            - '362'
+            - '363'
+    condition: by_text or by_id
+level: medium
+---
+title: 'Kaspersky: попытка открыть запрещенный веб-ресурс'
+id: 87c054ff-7be1-54b9-805f-d3774fa7ec56
+status: experimental
+description: Веб-Контроль заблокировал доступ к сайту запрещенной категории (социальные сети, файлообменники и т. п.) — попытка выхода в интернет с АРМ.
+author: EVTX Audit
+date: 2026-10-15
+evtxa_group: Средства защиты
+fstec239: [ЗИС]
+fields:
+    - Событие=Kaspersky.Summary
+    - Адрес=Kaspersky.Object
+    - Правило=Kaspersky.Reason
+    - Программа=Kaspersky.Application
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(веб-(ресурс|сайт|страниц)\w*\s+(\w+\s+)?(заблокирован|запрещ[её]н)|(доступ|переход)\w*\s+(к|на)\s+веб-(ресурс|сайт|страниц)\w*\s+(\w+\s+)?(заблокирован|запрещ[её]н)|(access\s+to\s+)?web\s+(resource|page|site)\s+(was\s+|is\s+)?(blocked|denied|prohibited))'
+    condition: by_text
+level: medium
+---
+title: 'Kaspersky: запуск программы запрещен (Контроль программ)'
+id: e543520c-f46e-5769-bc21-180639fb2fee
+status: experimental
+description: Попытка запустить программу, не разрешенную политикой Контроля программ (неучтенное ПО, игры, портативные утилиты, программы с флешки).
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.execution
+    - attack.t1204
+evtxa_group: Запуск программ
+fstec239: [ОПС]
+fields:
+    - Событие=Kaspersky.Summary
+    - Программа=Kaspersky.Application
+    - Объект=Kaspersky.Object
+    - Правило=Kaspersky.Reason
+    - SHA256=Kaspersky.Hash
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(запуск\w*\s+(\w+\s+)?(программ|приложени|процесс)\w*\s+(\w+\s+)?(запрещ[её]н|заблокирован)|(запрещ[её]н|заблокирован)\w*\s+запуск|запрещ[её]нн\w*\s+(программ|процесс|приложени)|(application|program|process)\s+startup\s+(was\s+|is\s+)?(prohibited|blocked|denied)|startup\s+of\s+(the\s+)?(application|program)\s+(was\s+|is\s+)?(prohibited|blocked|denied)|prohibited\s+(application|process|program))'
+    condition: by_text
+falsepositives:
+    - Новая версия разрешенной программы, не добавленная в правила
+level: medium
+---
+title: 'Kaspersky: доступ к устройству заблокирован (Контроль устройств)'
+id: e7854cb4-2f18-55f3-a538-b2ec7d476815
+status: experimental
+description: Попытка подключить или использовать запрещенное устройство — флешку, телефон, модем, принтер. Пользователь — тот, кто работал за компьютером в это время.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.initial-access
+    - attack.t1200
+evtxa_group: Съемные носители
+fstec239: [ЗНИ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Устройство=Kaspersky.Device
+    - Объект=Kaspersky.Object
+    - Правило=Kaspersky.Reason
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)((доступ|подключени|операци)\w*\s+(\w+\s+){0,2}устройств\w*\s+(\w+\s+)?(заблокирован|запрещ[её]н|ограничен)|устройств\w*\s+(\w+\s+)?(заблокирован|запрещ[её]н)|(заблокирован|запрещ[её]н)\w*\s+(доступ|подключение)\s+(к\s+)?устройств|(access\s+to|connection\s+of|operation\s+with)\s+(the\s+)?device\s+(was\s+|is\s+)?(blocked|denied|prohibited|restricted)|device\s+(was\s+|is\s+)?(blocked|denied|prohibited))'
+    by_id:
+        Kaspersky.Id: '802'
+    condition: by_text or by_id
+level: medium
+---
+title: 'Kaspersky: подключена неавторизованная клавиатура (BadUSB)'
+id: b83ee856-5cb7-5dc3-8860-9355ec3f749e
+status: experimental
+description: Подключено устройство, представившееся клавиатурой, которое не авторизовано кодом. Это может быть новая клавиатура или BadUSB-устройство, набирающее команды.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.initial-access
+    - attack.t1200
+evtxa_group: Съемные носители
+fstec239: [ЗНИ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Устройство=Kaspersky.Device
+    - Объект=Kaspersky.Object
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(клавиатур\w*\s+(\w+\s+)?(не\s+авторизован|заблокирован)|неавторизованн\w*\s+клавиатур|keyboard\s+(is\s+|was\s+)?(not\s+authorized|unauthorized|blocked)|unauthorized\s+keyboard)'
+    condition: by_text
+falsepositives:
+    - Замена клавиатуры или сканера штрихкодов
+level: medium
+---
+title: 'Kaspersky: заблокирован вредоносный скрипт (AMSI)'
+id: dcda15d9-344f-5855-ba83-0e3471af574f
+status: experimental
+description: Через интерфейс AMSI заблокирован вредоносный скрипт PowerShell, VBScript, JScript или макрос.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.execution
+    - attack.t1059
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Угроза=Kaspersky.Threat
+    - Объект=Kaspersky.Object
+    - Программа=Kaspersky.Application
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(запрос\w*\s+amsi|amsi\s+request|amsi.{0,40}(заблокирован|blocked|обнаружен|detected))'
+    by_id:
+        Kaspersky.Id: '2200'
+    condition: by_text or by_id
+level: high
+---
+title: 'Kaspersky: защита выключена (компоненты, самозащита, автозапуск)'
+id: c0bd13aa-23e8-5e6e-b587-b794c73a5c06
+status: experimental
+description: Выключены или приостановлены компоненты защиты, самозащита или автозапуск антивируса. Персоналу АСУ ТП менять настройки средств защиты запрещено.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.defense-evasion
+    - attack.t1562.001
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Компонент=Kaspersky.Component
+    - Причина=Kaspersky.Reason
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)((компонент\w*\s+защиты|защит\w*|самозащит\w*|автозапуск\w*)\s+(\w+\s+)?(выключен|отключен|приостановлен|остановлен)|(выключен|отключен|приостановлен)\w*\s+(\w+\s+)?(компонент\w*\s+защиты|защит|самозащит|автозапуск)|(protection(\s+components?)?|self-defen[cs]e|autorun)\s+(is\s+|are\s+|was\s+|were\s+|has\s+been\s+|have\s+been\s+)?(disabled|turned\s+off|paused|stopped)|(disabled|paused|turned\s+off)\s+(the\s+)?(protection|self-defen[cs]e|autorun))'
+    by_id:
+        Kaspersky.Id:
+            - '209'
+            - '211'
+            - '214'
+    condition: by_text or by_id
+falsepositives:
+    - Плановые работы администратора средств защиты
+level: high
+---
+title: 'Kaspersky: работа антивируса завершена'
+id: 7c7cf5cc-b985-5641-9476-b1dadba3d83f
+status: experimental
+description: Программа или служба антивируса остановлена. При выключении компьютера это нормально; в остальное время — защита не работала.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.defense-evasion
+    - attack.t1562.001
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Причина=Kaspersky.Reason
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)^\s*((работа\s+)?(программ|приложени|служб)\w*\s+(\w+\s+)?(завершен|остановлен|выгружен)|(выход|завершение\s+работы)\s+(из\s+)?(программ|приложени)|(application|program|service)\s+(was\s+|has\s+been\s+)?(stopped|closed|exited|terminated|unloaded))'
+    condition: by_text
+falsepositives:
+    - Выключение или перезагрузка компьютера, обновление антивируса
+level: medium
+---
+title: 'Kaspersky: попытка вмешательства в работу антивируса'
+id: e8fd301a-9e58-5a42-8844-07cbbf6d86d2
+status: experimental
+description: Самозащита заблокировала операцию с файлами, процессами, службами или ключами реестра антивируса — кто-то или что-то пыталось остановить, удалить или изменить его.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.defense-evasion
+    - attack.t1562.001
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Программа=Kaspersky.Application
+    - Объект=Kaspersky.Object
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)((заблокирован|запрещ[её]н|предотвращ[её]н)\w*\s+(\w+\s+){0,2}самозащит|самозащит\w*\s+(\w+\s+)?(заблокировал|запретил|предотвратил)|(blocked|prevented|denied)\s+by\s+self-defen[cs]e|операци\w*\s+с\s+ресурсами\s+(программы|приложения)|operations?\s+(on|with)\s+(the\s+)?application\s+resources)'
+    by_id:
+        Kaspersky.Id: '213'
+    condition: by_text or by_id
+falsepositives:
+    - Средства инвентаризации и резервного копирования, обращающиеся к файлам антивируса
+level: high
+---
+title: 'Kaspersky: неверный пароль при операции с антивирусом'
+id: 7c7231d1-34aa-53b9-b545-94f953e892b1
+status: experimental
+description: При попытке выполнить защищенную паролем операцию (выключение защиты, выход, удаление, изменение настроек) введен неверный пароль.
+author: EVTX Audit
+date: 2026-10-15
+evtxa_group: Средства защиты
+fstec239: [АВЗ, ИАФ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Причина=Kaspersky.Reason
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)((неверн|неправильн)\w*\s+пароль|пароль\s+(\w+\s+)?(неверн|неправильн)|(incorrect|wrong|invalid)\s+password|password\s+(is\s+|was\s+)?(incorrect|wrong|invalid))'
+    condition: by_text
+level: medium
+---
+title: 'Kaspersky: нарушена целостность антивируса'
+id: 32bdeb27-3104-52d1-b80e-d5b89b751f0f
+status: experimental
+description: Проверка целостности обнаружила измененные или поврежденные модули антивируса.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.defense-evasion
+    - attack.t1562.001
+evtxa_group: Средства защиты
+fstec239: [АВЗ, ОЦЛ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Объект=Kaspersky.Object
+    - Результат=Kaspersky.Result
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(целостност\w*\s+(\w+\s+){0,2}(нарушен|поврежд|не\s+подтвержд)|нарушен\w*\s+целостност|integrity\s+(is\s+|was\s+|has\s+been\s+)?(violated|compromised|broken|damaged)|integrity\s+check\s+failed)'
+    condition: by_text
+level: high
+---
+title: 'Kaspersky: изменены параметры защиты или исключения'
+id: f80365e1-570d-58a8-9d71-c14bad2b0e0b
+status: experimental
+description: Изменены параметры антивируса, политика или список исключений / доверенных программ. Если это сделал не администратор средств защиты через Kaspersky Security Center — нарушение.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.defense-evasion
+    - attack.t1562.001
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Компонент=Kaspersky.Component
+    - Причина=Kaspersky.Reason
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)((параметр|настро|исключени|доверенн)\w*\s+(\w+\s+){0,2}(изменен|измен[её]н|добавлен|удал[её]н)|(изменен|измен[её]н|добавлен)\w*\s+(\w+\s+)?(параметр|настро|исключени|доверенн)|(settings|exclusions?|trusted\s+(zone|applications?))\s+(\w+\s+){0,2}(changed|modified|added|removed)|(changed|modified)\s+(application\s+|protection\s+)?settings)'
+    condition: by_text
+falsepositives:
+    - Изменение политики администратором Kaspersky Security Center
+level: medium
+---
+title: 'Kaspersky: базы устарели или повреждены'
+id: ca5e96fc-c18d-5399-a2e4-75d72272e4b7
+status: experimental
+description: Антивирусные базы сильно устарели, отсутствуют или повреждены — защита от новых угроз не работает.
+author: EVTX Audit
+date: 2026-10-15
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Причина=Kaspersky.Reason
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(баз\w*\s+(\w+\s+)?(устарел|отсутству|поврежд)|(databases?|bases)\s+(are\s+|is\s+)?(extremely\s+|very\s+|severely\s+)?(out\s+of\s+date|obsolete|outdated|missing|corrupted|damaged))'
+    by_id:
+        Kaspersky.Id:
+            - '206'
+            - '207'
+    condition: by_text or by_id
+falsepositives:
+    - Нет источника обновлений в изолированном сегменте
+level: medium
+---
+title: 'Kaspersky: автоматическое обновление выключено'
+id: 2224ece2-cb5c-508a-8338-ed0bcf37baf6
+status: experimental
+description: Выключено автоматическое обновление баз — со временем защита устареет.
+author: EVTX Audit
+date: 2026-10-15
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(обновлени\w*\s+(\w+\s+)?(выключен|отключен)|(automatic\s+)?updates?\s+(is\s+|are\s+|was\s+|were\s+)?(disabled|turned\s+off))'
+    by_id:
+        Kaspersky.Id: '210'
+    condition: by_text or by_id
+level: medium
+---
+title: 'Kaspersky: ошибка обновления баз'
+id: aaef0ee2-93a0-5348-bf85-40da6ad2f1f2
+status: experimental
+description: Обновление баз завершилось ошибкой. Единичные ошибки — норма, но если базы давно не обновлялись, защита ослаблена.
+author: EVTX Audit
+date: 2026-10-15
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Причина=Kaspersky.Reason
+    - Результат=Kaspersky.Result
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(ошибк\w*\s+(\w+\s+)?обновлени|обновлени\w*\s+(\w+\s+)?(не\s+выполнен|заверш\w*\s+с\s+ошибк|прерван)|update\s+(\w+\s+)?(error|failed)|(error|failure)\s+(during|of)\s+(the\s+)?update)'
+    condition: by_text
+falsepositives:
+    - Временная недоступность сервера обновлений
+level: low
+---
+title: 'Kaspersky: лицензия истекла или недействительна'
+id: fa9466bd-d9e3-5108-b694-de141b6676ec
+status: experimental
+description: Лицензия истекла, ключ заблокирован или программа не активирована — базы не обновляются, часть функций может не работать.
+author: EVTX Audit
+date: 2026-10-15
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Причина=Kaspersky.Reason
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(лицензи\w*\s+(\w+\s+)?(истекл|закончил|недействител|заблокирован|нарушен|отсутству)|срок\w*\s+(действия\s+)?лицензи\w*\s+(истек\b|истекл|закончил)|нарушен\w*\s+лицензионн|ключ\w*\s+(\w+\s+)?(заблокирован|недействител|в\s+черном\s+списке)|программ\w*\s+не\s+активирован|license\s+(has\s+|is\s+)?(expired|invalid|blocked|missing)|license\s+agreement\s+(is\s+|was\s+|has\s+been\s+)?violated|key\s+(is\s+|was\s+)?(blocked|blacklisted|invalid)|(application|program)\s+(is\s+)?not\s+activated)'
+    expires_soon:
+        Kaspersky.Event|re: '(?i)(скоро|истекает|истечет|almost|soon|expires\s+in|will\s+expire)'
+    condition: by_text and not expires_soon
+level: medium
+---
+title: 'Kaspersky: задача проверки или обновления не выполнена'
+id: ec139ae3-7afd-5f43-a982-63e1bdc920dd
+status: experimental
+description: Задача антивируса (проверка, обновление, проверка целостности) не смогла запуститься или завершилась с ошибкой.
+author: EVTX Audit
+date: 2026-10-15
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Событие=Kaspersky.Summary
+    - Задача=Kaspersky.Component
+    - Причина=Kaspersky.Reason
+logsource:
+    product: windows
+detection:
+    by_text:
+        Kaspersky.Event|re: '(?i)(задач\w*\s+(\w+\s+)?не\s+(может\s+быть\s+)?(запущен|выполнен)|невозможно\s+запустить\s+задач|task\s+(cannot|could\s+not)\s+(run|be\s+started|start)|task\s+(has\s+)?failed)'
+    by_id:
+        Kaspersky.Id: '212'
+    condition: by_text or by_id
+level: low
+---
+title: Удален антивирус Касперского
+id: 5ee90a16-c39c-5457-a4b9-92ee9fcbd0f2
+status: experimental
+description: Антивирус Kaspersky или Агент администрирования удален через Windows Installer. Без согласования — грубое нарушение.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.defense-evasion
+    - attack.t1562.001
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Продукт=Data0
+    - Версия=Data1
+    - Код результата=Data3
+logsource:
+    product: windows
+    service: application
+detection:
+    selection:
+        Provider_Name: 'MsiInstaller'
+        EventID:
+            - 1034
+            - 11724
+    kaspersky:
+        Data0|contains:
+            - 'Kaspersky'
+            - 'Касперск'
+    condition: selection and kaspersky
+falsepositives:
+    - Переустановка или обновление антивируса администратором
+level: high
+---
+title: Служба антивируса Касперского отключена или аварийно завершена
+id: 550c08e7-1f4d-5238-827e-3912c363a532
+status: experimental
+description: Служба Kaspersky переведена в состояние «Отключена» или неожиданно завершилась — защита не работает.
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.defense-evasion
+    - attack.t1562.001
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Служба=param1
+    - Было=param2
+    - Стало=param3
+logsource:
+    product: windows
+    service: system
+detection:
+    disabled:
+        Provider_Name: 'Service Control Manager'
+        EventID: 7040
+        param3|contains:
+            - 'disabled'
+            - 'Отключ'
+    crashed:
+        Provider_Name: 'Service Control Manager'
+        EventID:
+            - 7031
+            - 7034
+    kaspersky:
+        - param1|contains:
+              - 'Kaspersky'
+              - 'Касперск'
+        - param4|startswith:
+              - 'AVP'
+              - 'klnagent'
+              - 'kavfs'
+    condition: (disabled or crashed) and kaspersky
+level: high
+---
+title: Антивирус выключен (Центр безопасности Windows)
+id: eb2d698b-2026-58d5-9b3a-4c57bcb417d7
+status: experimental
+description: Центр безопасности Windows зафиксировал, что сторонний антивирус выключен или его защита приостановлена (на серверных ОС событие не пишется).
+author: EVTX Audit
+date: 2026-10-15
+tags:
+    - attack.defense-evasion
+    - attack.t1562.001
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+fields:
+    - Продукт=Data0
+    - Состояние=Data1
+logsource:
+    product: windows
+    service: application
+detection:
+    selection:
+        Provider_Name: 'SecurityCenter'
+        EventID: 15
+        Data1|contains:
+            - 'SECURITY_PRODUCT_STATE_OFF'
+            - 'SECURITY_PRODUCT_STATE_SNOOZED'
+    defender:
+        Data0|contains: 'Defender'
+    condition: selection and not defender
+falsepositives:
+    - Обновление или переустановка антивируса
+level: medium
+---
 title: Изменены параметры брандмауэра Windows
 id: e84573ed-e86d-575f-b205-6e9a1bf27261
 status: stable
@@ -6284,6 +7116,22 @@ detection:
           param3|contains:
               - 'disabled'
               - 'Отключ'
+        - Provider_Name: 'Service Control Manager'
+          EventID: 7040
+          param1|contains: 'Kaspersky'
+          param3|contains:
+              - 'disabled'
+              - 'Отключ'
+        - Provider_Name: 'MsiInstaller'
+          EventID: 1034
+          Data0|contains:
+              - 'Kaspersky'
+              - 'Касперск'
+        - Kaspersky.Event|re: '(?i)((компонент\w*\s+защиты|защит\w*|самозащит\w*|автозапуск\w*)\s+(\w+\s+)?(выключен|отключен|приостановлен|остановлен)|(выключен|отключен|приостановлен)\w*\s+(\w+\s+)?(компонент\w*\s+защиты|защит|самозащит|автозапуск)|(protection(\s+components?)?|self-defen[cs]e|autorun)\s+(is\s+|are\s+|was\s+|were\s+|has\s+been\s+|have\s+been\s+)?(disabled|turned\s+off|paused|stopped)|(disabled|paused|turned\s+off)\s+(the\s+)?(protection|self-defen[cs]e|autorun))'
+        - Kaspersky.Id:
+              - '209'
+              - '211'
+              - '214'
     condition: selection
 level: informational
 ---
@@ -6516,18 +7364,22 @@ title: Обнаружена угроза (шаг цепочки)
 id: d15c9d5b-c7de-5099-a3ab-30a29699b6fe
 name: evtxa_av_detection
 status: stable
-description: Базовое правило корреляций.
+description: Базовое правило корреляций (Defender и Kaspersky).
 author: EVTX Audit
 date: 2026-10-14
 logsource:
     product: windows
-    service: windefend
 detection:
     selection:
-        EventID:
-            - 1006
-            - 1116
-    condition: selection
+        - Provider_Name: 'Microsoft-Windows-Windows Defender'
+          EventID:
+              - 1006
+              - 1116
+        - Kaspersky.Event|re: '(?i)(вредоносн\w*\s+(объект|программ|ПО|код|файл)|malicious\s+(object|software|code|file)|обнаружен\w*\s+(вирус|угроз|заражен\w*|опасн\w*\s+объект|объект)|virus\s+(was\s+)?(found|detected)|threat\s+(was\s+)?detected|infected\s+object|объект\s+заражен|заражен\w*\s+объект|object\s+(is\s+)?infected)'
+        - Kaspersky.Id: '302'
+    nothing_found:
+        Kaspersky.Event|re: '(?i)(не\s+обнаружен|not\s+(found|detected)|no\s+threats)'
+    condition: selection and not nothing_found
 level: informational
 ---
 # ---------------------------------------------------------------- цепочки (корреляции Sigma v2)
@@ -6880,6 +7732,39 @@ correlation:
     condition:
         gte: 3
 level: high
+---
+title: Многократное обнаружение угроз на компьютере
+id: 1d6d15dd-3f70-552f-9d43-d3e4f4cb4691
+status: experimental
+description: За час антивирус 5 и более раз обнаружил угрозы на одном компьютере — зараженный носитель, активное заражение или распространение ВПО по сети.
+author: EVTX Audit
+date: 2026-10-15
+evtxa_group: Средства защиты
+fstec239: [АВЗ]
+correlation:
+    type: event_count
+    rules:
+        - evtxa_av_detection
+    timespan: 1h
+    condition:
+        gte: 5
+level: high
+---
+title: Выключение защиты → подключение носителя
+id: 3e46feb8-4cb8-5dbb-94ff-327e58edff2f
+status: experimental
+description: В течение часа после выключения антивируса или его службы подключен съемный носитель — защиту отключили, чтобы перенести файлы.
+author: EVTX Audit
+date: 2026-10-15
+evtxa_group: Средства защиты
+fstec239: [АВЗ, ЗНИ]
+correlation:
+    type: temporal_ordered
+    rules:
+        - evtxa_protection_off
+        - evtxa_media
+    timespan: 1h
+level: critical
 '@
 $script:SigmaPackProcess=@'
 # Правила запуска процессов (Security 4688 с командной строкой или Sysmon 1).
@@ -9145,7 +10030,8 @@ function Test-V9 {
     $doc=New-Object Xml.XmlDocument; $doc.LoadXml($query)
     $selects=@($doc.SelectNodes("//Select") | ForEach-Object { $_.InnerText })
     Assert-True (@($selects | Where-Object { $_ -notmatch "EventID=\d|EventID<=$MaxEventId" }).Count -eq 0) 'v9 every selector has explicit IDs or the MaxEventId limit'
-    Assert-True (@((Build-Query 'C:\x\kaspersky.evtx' $true) -split '<Select>' | Where-Object { $_ -like '*</Select>*' -and $_ -notlike "*EventID&lt;=$MaxEventId*" }).Count -eq 0) 'v9 AV vendor selector limited by MaxEventId'
+    # v11.2: AV logs keep their own Event ID ranges; findings are still limited by -MaxEventId.
+    Assert-True (@((Build-Query 'C:\x\kaspersky.evtx' $true) -split '<Select>' | Where-Object { $_ -like '*</Select>*' -and $_ -like "*EventID&lt;=*" }).Count -eq 0) 'v9 AV vendor selector reads every Event ID'
     Assert-True (@($selects | Where-Object { $_ -like "*EventID=4776*Status']!='0x0'*" }).Count -eq 1) 'v9 successful 4776 filtered by Windows API'
     Assert-True (@($selects | Where-Object { $_ -match '(^|[^<>!])EventID=4776 or|or EventID=4776\)' }).Count -eq 0) 'v9 4776 not selected unfiltered'
     # Required event list (v9.1).
@@ -9680,6 +10566,85 @@ function Test-V10 {
         Remove-Item -LiteralPath $root -Recurse -Force
     }
 }
+# Kaspersky: text events in Russian and English (Kaspersky Event Log), bare KES 12
+# parameters in Application, uninstall, service, Windows Security Center and noise.
+function Test-V112Kaspersky {
+    if ($NoCompiledEngine) { Write-Host 'Kaspersky tests skipped: -NoCompiledEngine'; return }
+    $null=Get-EngineType
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('EvtxAudit-KAV-'+[guid]::NewGuid().ToString('N'))
+    $dir=Join-Path $root 'kav'; [void][IO.Directory]::CreateDirectory($dir)
+    $evtx=Join-Path $root 'WS01\Kaspersky Event Log.evtx'
+    $saved=@{}
+    foreach ($name in @('RunPath','SpoolPath','Part','PartRows','Summary','LogonAgg','FindingCount','BurstCount','RdpCount','RdpTotals','RdpClosed','RdpWriter','BurstWriter','ErrorWriter','SigmaSelectors','QueryCache')) { $saved[$name]=Get-Variable -Scope Script -Name $name -ValueOnly -ErrorAction SilentlyContinue }
+    try {
+        $script:ErrorWriter=New-Writer (Join-Path $root 'Errors.csv'); Write-Row $script:ErrorWriter @('Время UTC','Этап','Файл источника','Record ID','Ошибка')
+        $sigma=New-SigmaEngine @()
+        $script:SigmaSelectors=New-Object 'System.Collections.Generic.List[string]'; $script:QueryCache=@{}
+        foreach ($s in $sigma.GetSelectors($MaxEventId)) { $script:SigmaSelectors.Add($s) }
+        $query=Build-Query 'C:\Logs\Application.evtx' $false
+        $vendor=Build-Query 'C:\Logs\Kaspersky Event Log.evtx' $true
+        $doc=New-Object Xml.XmlDocument; $doc.LoadXml($query)
+        $selects=(@($doc.SelectNodes('//Select') | ForEach-Object { $_.InnerText }) -join "`n")
+        Assert-True ($selects.Contains("Channel='Kaspersky Event Log'") -and $selects.Contains("Provider[@Name='avp']") -and $selects.Contains("Channel='Application' and (EventID=") -and $selects.Contains('EventID=302') -and
+            -not $vendor.Contains('EventID&lt;=')) 'Kaspersky: channels, providers and KES codes in the Windows query; AV logs without the Event ID limit'
+        $kel='Kaspersky Event Log'; $op='S-1-5-21-1-2-3-1100'; $nl="`r`n"
+        $kav={ param($Time,[string[]]$Lines,$Provider='KES',$Id=1) New-V10Event $Provider $Id $Time $kel @(($Lines -join $nl)) '0x80000000000000' 'S-1-5-18' }
+        $detect={ param($Time,$File) & $kav $Time @('Тип события: Обнаружен вредоносный объект','Приложение\Название: Kaspersky Endpoint Security для Windows','Пользователь: NT AUTHORITY\SYSTEM (Системный пользователь)','Компонент: Защита от файловых угроз','Результат\Описание: Обнаружено','Результат\Тип: Троянская программа','Результат\Название: HEUR:Trojan.Win32.Generic','Объект\Тип: Файл','Объект\Путь: E:\',('Объект\Название: '+$File)) }
+        $script:V10Rid=0
+        $l=New-Object 'System.Collections.Generic.List[string]'
+        $l.Add((New-V10Event 'Microsoft-Windows-Security-Auditing' 4624 '08:00:00' 'Security' ([ordered]@{SubjectUserSid='S-1-5-18';TargetUserSid=$op;TargetUserName='operator';TargetDomainName='WS01';TargetLogonId='0x111';LogonType='2';IpAddress='127.0.0.1'})))
+        $l.Add((& $kav '08:10:00' @('Event type: Protection components are disabled','Application\Name: Kaspersky Endpoint Security for Windows','User: WS01\admin (Initiator)','Component: File Threat Protection')))
+        $l.Add((New-V10Event 'Microsoft-Windows-Security-Auditing' 6416 '08:20:00' 'Security' ([ordered]@{SubjectUserSid='S-1-5-18';SubjectUserName='WS01$';SubjectDomainName='LAB';DeviceId='USBSTOR\Disk&Ven_Generic&Prod_Flash&Rev_1.00\AA11&0';DeviceDescription='Disk drive';ClassName='DiskDrive'})))
+        foreach ($f in @('setup.exe','autorun.inf','crack.exe','doc.scr')) { $l.Add((& $detect ('08:21:0'+$l.Count) $f)) }
+        $l.Add((& $kav '08:21:30' @('Тип события: Объект не вылечен','Компонент: Защита от файловых угроз','Результат\Описание: Не вылечен','Результат\Название: HEUR:Trojan.Win32.Generic','Объект\Путь: E:\','Объект\Название: doc.scr')))
+        $l.Add((& $kav '08:22:00' @('Тип события: Объект удален','Результат\Название: HEUR:Trojan.Win32.Generic','Объект\Путь: E:\','Объект\Название: setup.exe')))
+        $l.Add((& $kav '08:30:00' @('Тип события: Доступ к устройству заблокирован','Устройство: Съемный диск','Идентификатор устройства: USBSTOR\DISK&VEN_KINGSTON\BB22&0','Правило: Запрет съемных дисков')))
+        $l.Add((& $kav '08:40:00' @('Тип события: Обнаружена легальная программа, которая может быть использована злоумышленником для нанесения вреда компьютеру или данным пользователя','Пользователь: WS01\operator (Активный пользователь)','Результат\Название: not-a-virus:RemoteAdmin.Win32.RAdmin.d','Объект\Путь: C:\Users\operator\Downloads\','Объект\Название: radmin.exe')))
+        $l.Add((& $kav '08:41:00' @('Тип события: Операции с ресурсами программы заблокированы самозащитой','Приложение\Путь: C:\Windows\System32\taskkill.exe','Пользователь: WS01\operator (Инициатор)')))
+        $l.Add((& $kav '08:42:00' @('Тип события: Запуск программы запрещен','Приложение\Название: game.exe','Приложение\Путь: E:\games\','Правило: Запрещенные программы')))
+        # Noise: updates, scan without threats, task started.
+        $l.Add((& $kav '08:50:00' @('Тип события: Базы программы обновлены','Компонент: Обновление')))
+        $l.Add((& $kav '08:51:00' @('Тип события: Проверка завершена. Угроз не обнаружено','Не обработано: 0')))
+        $l.Add((& $kav '08:52:00' @('Тип события: Задача запущена','Задача: Быстрая проверка')))
+        # KES 12 in Application: bare parameters, Windows event codes.
+        $l.Add((New-V10Event 'avp' 302 '09:00:00' 'Application' @('0F343B0931126A20F133D67C2B018A3B5D6F5B0F5E2B3E7A9C1D2E3F4A5B6C7D','C:\Users\operator\Downloads\keygen.exe') '0x80000000000000'))
+        $l.Add((New-V10Event 'avp' 1001 '09:00:30' 'Application' @('0F343B0931126A20F133D67C2B018A3B5D6F5B0F5E2B3E7A9C1D2E3F4A5B6C7D') '0x80000000000000'))
+        $l.Add((New-V10Event 'MsiInstaller' 1034 '09:10:00' 'Application' @('Kaspersky Endpoint Security для Windows','12.3.0.493','1049','0','АО Лаборатория Касперского','(NULL)','') '0x80000000000000' $op))
+        $l.Add((New-V10Event 'Service Control Manager' 7040 '09:11:00' 'System' ([ordered]@{param1='Kaspersky Endpoint Security Service';param2='auto start';param3='disabled';param4='AVP'}) '0x8080000000000000' $op))
+        $l.Add((New-V10Event 'SecurityCenter' 15 '09:12:00' 'Application' @('Kaspersky Endpoint Security для Windows','SECURITY_PRODUCT_STATE_OFF') '0x80000000000000'))
+        $l.Add((New-V10Event 'SecurityCenter' 15 '09:12:01' 'Application' @('Windows Defender','SECURITY_PRODUCT_STATE_OFF') '0x80000000000000'))
+        $c=Invoke-V10Engine $dir $evtx $l $sigma
+        $vw=New-Writer (Join-Path $dir 'Violations.csv')
+        try { $count=$sigma.WriteViolations($vw,[string]$Delimiter) } finally { Close-Writer $vw }
+        $viol=@(Import-Csv -LiteralPath (Join-Path $dir 'Violations.csv') -Delimiter $Delimiter -Encoding UTF8)
+        $alerts=@(Import-Csv -LiteralPath (Join-Path $dir 'SigmaAlerts.csv') -Delimiter $Delimiter -Encoding UTF8)
+        $row={ param($Like) @($viol | Where-Object { $_.'Нарушение' -like $Like }) }
+        $off=@(& $row 'Kaspersky: защита выключена*')
+        Assert-True ($off.Count -eq 1 -and $off[0].'Уровень' -eq 'Высокий' -and $off[0].'Пользователь' -eq 'WS01\admin' -and $off[0].'Детали' -like 'Событие: Protection components are disabled; Компонент: File Threat Protection*') 'Kaspersky: English text, protection disabled by a user'
+        $det=@(& $row 'Kaspersky: обнаружен вредоносный объект*')
+        Assert-True ($det.Count -eq 5 -and @($det | Where-Object { $_.'Детали' -like '*Угроза: HEUR:Trojan.Win32.Generic; Тип: Троянская программа; Объект: E:\setup.exe*' }).Count -eq 1 -and
+            @($det | Where-Object { $_.'Детали' -like 'Объект: C:\Users\operator\Downloads\keygen.exe; SHA256: 0F343B09*' -and $_.'Event ID' -eq '302' }).Count -eq 1 -and $det[0].'Группа' -eq 'Средства защиты' -and
+            $det[0].'Пользователь' -like 'вероятно WS01\operator*' -and $det[0].'Детали' -notlike '*Kaspersky Endpoint Security*') 'Kaspersky: detections from Russian text and from bare KES 12 parameters (ID 302)'
+        $nc=@(& $row 'Kaspersky: угроза не устранена*')
+        Assert-True ($nc.Count -eq 1 -and $nc[0].'Уровень' -eq 'Критический' -and $nc[0].'Детали' -like '*Объект: E:\doc.scr*') 'Kaspersky: not disinfected is critical'
+        Assert-True ((& $row 'Kaspersky: объект обезврежен*').Count -eq 1 -and (& $row 'Kaspersky: объект обезврежен*')[0].'Уровень' -eq 'Низкий') 'Kaspersky: object deleted is low'
+        $dev=@(& $row 'Kaspersky: доступ к устройству заблокирован*')
+        Assert-True ($dev.Count -eq 1 -and $dev[0].'Группа' -eq 'Съемные носители' -and $dev[0].'Детали' -like '*Устройство: Съемный диск*Правило: Запрет съемных дисков*' -and $dev[0].'Пользователь' -like 'вероятно WS01\operator*') 'Kaspersky: device blocked, probable user'
+        $legal=@(& $row 'Kaspersky: обнаружена легальная программа*')
+        Assert-True ($legal.Count -eq 1 -and $legal[0].'Нарушение' -notlike '*вредоносный объект*' -and $legal[0].'Пользователь' -eq 'WS01\operator' -and $legal[0].'Детали' -like '*not-a-virus:RemoteAdmin*radmin.exe*') 'Kaspersky: riskware is not reported as malware'
+        Assert-True ((& $row 'Kaspersky: попытка вмешательства*')[0].'Детали' -like '*taskkill.exe*' -and (& $row 'Kaspersky: запуск программы запрещен*')[0].'Детали' -like '*Программа: game.exe*') 'Kaspersky: self-defense and application control'
+        $svc=@(& $row 'Служба антивируса Касперского*')
+        Assert-True ((& $row '*Удален антивирус Касперского*').Count -eq 1 -and $svc.Count -eq 1 -and $svc[0].'Пользователь' -eq 'WS01\operator (S-1-5-21-1-2-3-1100)' -and (& $row 'Антивирус выключен (Центр безопасности Windows)').Count -eq 1) 'Kaspersky: uninstall, service disabled, Security Center (not Defender)'
+        Assert-True ($viol.Count -eq 16 -and $count -eq 16 -and @($viol | Where-Object { $_.'Детали' -like '*обновлены*' -or $_.'Детали' -like '*Угроз не обнаружено*' -or $_.'Детали' -like '*Задача запущена*' }).Count -eq 0) ('Kaspersky: '+$viol.Count+' violation rows, updates, clean scans and tasks are not violations')
+        $titles=@($alerts | ForEach-Object { $_.'Правило' })
+        foreach ($expected in @('Многократное обнаружение угроз на компьютере','Выключение защиты → подключение носителя','Обнаружение угрозы после подключения носителя')) { Assert-True ($expected -in $titles) ('Kaspersky chain: '+$expected) }
+    } finally {
+        foreach ($k in $saved.Keys) { Set-Variable -Scope Script -Name $k -Value $saved[$k] }
+        foreach ($w in @($script:Writers)) { try { $w.Dispose() } catch { } }
+        $script:Writers.Clear()
+        Remove-Item -LiteralPath $root -Recurse -Force
+    }
+}
 if ($SelfTest) {
     # Fixtures use deterministic thresholds, independent of scan parameters.
     $FailureThreshold=10; $WindowMinutes=10; $TriageWindowMinutes=30; $SprayUserThreshold=5
@@ -9696,6 +10661,7 @@ if ($SelfTest) {
     Test-V92Triage
     Test-V92Pipeline
     Test-V10
+    Test-V112Kaspersky
     Write-Host ('ALL SELFTESTS PASSED — version '+$script:Version)
     } finally { $script:HashEngine.Dispose() }
     return
