@@ -46,13 +46,13 @@ rules/windows/builtin). Поддерживаемое подмножество о
 Только самопроверка (журналы не читаются).
 
 .EXAMPLE
-& .\Audit-Evtx-11.4.ps1 -SelfTest
+& .\Audit-Evtx-11.5.ps1 -SelfTest
 
 .EXAMPLE
-& .\Audit-Evtx-11.4.ps1 -InputPath D:\Выгрузки -OutputPath D:\Отчеты -StartTime '2026-09-01'
+& .\Audit-Evtx-11.5.ps1 -InputPath D:\Выгрузки -OutputPath D:\Отчеты -StartTime '2026-09-01'
 
 .EXAMPLE
-& .\Audit-Evtx-11.4.ps1 -InputPath D:\Выгрузки -SigmaRulesPath D:\sigma\rules\windows\builtin
+& .\Audit-Evtx-11.5.ps1 -InputPath D:\Выгрузки -SigmaRulesPath D:\sigma\rules\windows\builtin
 
 .NOTES
 См. README.md: семантика, ограничения и статус проверки.
@@ -97,7 +97,7 @@ param(
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$script:Version = '11.4.0'
+$script:Version = '11.5.0'
 $script:Utf8 = New-Object System.Text.UTF8Encoding($true)
 $script:Invariant = [Globalization.CultureInfo]::InvariantCulture
 # Time zone for the "(местное)" columns: -DisplayTimeZone (Windows id, e.g. 'Russian Standard Time') or this computer's zone.
@@ -696,8 +696,10 @@ function Match-Event($e, [bool]$VendorFile) {
     }
     if ($VendorFile -and $null -eq $r) {
         $vendorText = $e.Xml + ' ' + $e.Message
-        $negative = $vendorText -match '(?i)(no\s+threats?\s+(were\s+)?found|no\s+malware\s+(was\s+)?found|угроз\s+не\s+обнаружено|вредоносн\w*\s+не\s+обнаружено|заражени\w*\s+не\s+обнаружено)'
-        $threat = $vendorText -match '(?i)(infected|infection|malware|trojan|ransomware|virus|threat\s+(was\s+)?detected|quarantin|угроз|заражен|вредонос|троян|вирус|обнаружен\w*\s+угроз|карантин)'
+        # v11.5: whole phrases ("threat detected", "object infected"), not word parts: "Anti-Virus",
+        # "Антивирус" and "Защита от файловых угроз" are in almost every event of an AV log.
+        $negative = $vendorText -match '(?i)(no\s+threats?\s+(were\s+|was\s+)?(found|detected)|no\s+malware\s+(was\s+)?found|угроз\w*\s+не\s+(обнаружен|найден)|вредоносн\w*\s+\w*\s*не\s+обнаружен|заражени\w*\s+не\s+обнаружен|(заражен\w*|инфицирован\w*|infected)\s*:\s*0\b)'
+        $threat = $vendorText -match '(?i)((обнаружен\w*|обнаружил\w*|найден\w*)\s+(\w+\s+){0,2}(угроз|вирус|вредоносн|заражен|троян|инфицирован)|(угроз\w*|вирус\w*|троян\w*)\s+(\w+\s+){0,2}(обнаружен|найден|удален|вылечен|заблокирован|помещен)|(заражен|инфицирован)\w*\s+(объект|файл)|(объект|файл)\w*\s+(\w+\s+)?(заражен|инфицирован)|помещен\w*\s+в\s+карантин|\binfected\b|\binfection\b|\btrojan\b|\bransomware\b|(threat|virus|malware)\s+(was\s+|is\s+)?(detected|found|blocked|deleted|quarantined)|(detected|found)\s+(\w+\s+){0,2}(threat|virus|malware|trojan)|\bquarantined\b|moved\s+to\s+quarantine)'
         if ($threat -and -not $negative) {
             $r = [pscustomobject]@{Category='Антивирус';Severity='High';Title='Сторонний антивирус: возможное обнаружение угрозы';Note='Эвристика по XML/описанию. Проверить точное действие, объект, результат лечения и контекст в исходном EVTX.';RuleId='AV-VENDOR-THREAT'}
         } elseif ($e.Level -in @(1,2)) {
@@ -1685,7 +1687,7 @@ namespace __NS__
 
     public sealed class Engine : IDisposable
     {
-        public const string Version = "11.4.0";
+        public const string Version = "11.5.0";
         // Configuration (set by PowerShell before Open()).
         public bool IncludeNoise, IncludeNetworkLogons, DeepScriptScan, IncludeProcessCreation, IncludeAllAntivirusEvents, GenericErrors, SkipCorrelation, KeepEvidence;
         public int MaxEventId = 10000, FailureThreshold = 10, WindowMinutes = 10, SprayUserThreshold = 5, RowsPerCsv = 500000;
@@ -1732,8 +1734,10 @@ namespace __NS__
         static readonly Regex BadPassword = new Regex("^(0x)?c000006a$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         static readonly Regex Ffff = new Regex("^::ffff:", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         static readonly Regex CommandHeuristic = new Regex(@"(?i)(-(enc|encodedcommand)\s|FromBase64String|DownloadString|Invoke-Expression|\biex\s|wevtutil\s+(cl|clear-log)\b|Clear-EventLog|vssadmin\s+delete\s+shadows|Set-MpPreference.+Disable|Add-MpPreference.+Exclusion)", RegexOptions.CultureInvariant);
-        static readonly Regex VendorNegative = new Regex("(?i)(no\\s+threats?\\s+(were\\s+)?found|no\\s+malware\\s+(was\\s+)?found|угроз\\s+не\\s+обнаружено|вредоносн\\w*\\s+не\\s+обнаружено|заражени\\w*\\s+не\\s+обнаружено)", RegexOptions.CultureInvariant);
-        static readonly Regex VendorThreat = new Regex("(?i)(infected|infection|malware|trojan|ransomware|virus|threat\\s+(was\\s+)?detected|quarantin|угроз|заражен|вредонос|троян|вирус|обнаружен\\w*\\s+угроз|карантин)", RegexOptions.CultureInvariant);
+        // Whole phrases, not word parts: "Anti-Virus", "Антивирус" and "Защита от файловых угроз" are in
+        // almost every event of an AV log. Same patterns as Match-Event in PowerShell.
+        static readonly Regex VendorNegative = new Regex(@"(?i)(no\s+threats?\s+(were\s+|was\s+)?(found|detected)|no\s+malware\s+(was\s+)?found|угроз\w*\s+не\s+(обнаружен|найден)|вредоносн\w*\s+\w*\s*не\s+обнаружен|заражени\w*\s+не\s+обнаружен|(заражен\w*|инфицирован\w*|infected)\s*:\s*0\b)", RegexOptions.CultureInvariant);
+        static readonly Regex VendorThreat = new Regex(@"(?i)((обнаружен\w*|обнаружил\w*|найден\w*)\s+(\w+\s+){0,2}(угроз|вирус|вредоносн|заражен|троян|инфицирован)|(угроз\w*|вирус\w*|троян\w*)\s+(\w+\s+){0,2}(обнаружен|найден|удален|вылечен|заблокирован|помещен)|(заражен|инфицирован)\w*\s+(объект|файл)|(объект|файл)\w*\s+(\w+\s+)?(заражен|инфицирован)|помещен\w*\s+в\s+карантин|\binfected\b|\binfection\b|\btrojan\b|\bransomware\b|(threat|virus|malware)\s+(was\s+|is\s+)?(detected|found|blocked|deleted|quarantined)|(detected|found)\s+(\w+\s+){0,2}(threat|virus|malware|trojan)|\bquarantined\b|moved\s+to\s+quarantine)", RegexOptions.CultureInvariant);
         const string Security = "Microsoft-Windows-Security-Auditing";
         const string Cut = " [обрезано; полный текст смотрите в исходном EVTX или техническом Evidence при -KeepTechnicalFiles]";
 
@@ -1959,7 +1963,8 @@ namespace __NS__
             {
                 string vendorText = e.Xml + " " + e.Message;
                 bool negative = VendorNegative.IsMatch(vendorText);
-                bool threat = VendorThreat.IsMatch(vendorText);
+                // With Sigma, Kaspersky events are classified by the Kaspersky rules.
+                bool threat = !(Sigma != null && Kaspersky.Is(e)) && VendorThreat.IsMatch(vendorText);
                 if (threat && !negative)
                 {
                     r = new RuleDef(); r.Category = "Антивирус"; r.Severity = "High"; r.Title = "Сторонний антивирус: возможное обнаружение угрозы";
@@ -10843,6 +10848,28 @@ function Test-V114Rules {
         Assert-True (@(& $row 'Подключено Bluetooth-устройство').Count -eq 1) 'v11.4: Bluetooth device'
         $clear=@(& $row 'Вход с паролем в открытом виде (тип 8)')
         Assert-True ($clear.Count -eq 3 -and $clear[0].'Уровень' -eq 'Средний' -and $clear[0].'Повторов' -eq '3' -and (@($clear | ForEach-Object { [int]$_.'Повторов' }) | Measure-Object -Sum).Sum -eq 7 -and $clear[0].'Детали' -like '*w3wp.exe*') 'v11.4: cleartext logons, rows merged only within a minute of the first event'
+        # AV logs read whole: only real detections are findings, not every event that names the product.
+        $nl="`r`n"; $script:V10Rid=0
+        $avCases=@(
+            @($false,'KES','Тип события: Базы программы обновлены'+$nl+'Приложение\Название: Kaspersky Anti-Virus'+$nl+'Компонент: Защита от файловых угроз'),
+            @($false,'KES','Event type: Task completed'+$nl+'Application\Name: Kaspersky Anti-Virus'+$nl+'Component: Malware Scan'),
+            @($false,'DrWeb','SpIDer Guard: проверено файлов 120, заражено: 0. Антивирусные базы актуальны.'),
+            @($false,'DrWeb','Проверка завершена. Угроз не обнаружено.'),
+            @($true,'KES','Тип события: Обнаружен вредоносный объект'+$nl+'Объект\Путь: E:\'),
+            @($true,'DrWeb','Файл E:\setup.exe инфицирован Trojan.Packed.123'),
+            @($true,'ESET','Threat detected: Win32/Agent.XYZ in C:\x.exe'))
+        $avDir=Join-Path $root 'av'; [void][IO.Directory]::CreateDirectory($avDir)
+        $engine=New-AuditEngine $avDir
+        try {
+            $engine.Open(); $engine.BeginFile((Join-Path $root 'av.evtx'),$root,'av.evtx',$true,'')
+            foreach ($case in $avCases) {
+                $x=New-V10Event $case[1] 1 '10:00:00' 'Application' @($case[2]) '0x80000000000000'
+                $ps=$null -ne (Match-Event (Parse-Event $x) $true); $cs=$null -ne $engine.Match($engine.Parse($x))
+                Assert-True ($ps -eq $case[0] -and $cs -eq $case[0]) ('v11.5 AV heuristic: '+$(if($case[0]){'detection'}else{'no finding'})+' — '+$case[2].Split("`r")[0])
+            }
+            $engine.Sigma=$sigma
+            Assert-True ($null -eq $engine.Match($engine.Parse((New-V10Event 'KES' 1 '10:00:00' 'Kaspersky Event Log' @('Тип события: Обнаружен вредоносный объект') '0x80000000000000')))) 'v11.5 AV heuristic: Kaspersky events are left to the Kaspersky rules'
+        } finally { $engine.Dispose() }
         $findings=@(Import-Csv -LiteralPath (Join-Path $dir 'Findings-0001.csv') -Delimiter $Delimiter -Encoding UTF8 | Where-Object { $_.'Event ID' -eq '4624' })
         Assert-True ($findings.Count -eq 7 -and @($findings | Where-Object { $_.'Событие' -eq 'Вход с паролем в открытом виде (тип 8)' }).Count -eq 7) 'v11.4: every cleartext logon is a finding'
     } finally {
