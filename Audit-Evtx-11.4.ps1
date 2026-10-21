@@ -46,13 +46,13 @@ rules/windows/builtin). Поддерживаемое подмножество о
 Только самопроверка (журналы не читаются).
 
 .EXAMPLE
-& .\Audit-Evtx-11.3.ps1 -SelfTest
+& .\Audit-Evtx-11.4.ps1 -SelfTest
 
 .EXAMPLE
-& .\Audit-Evtx-11.3.ps1 -InputPath D:\Выгрузки -OutputPath D:\Отчеты -StartTime '2026-09-01'
+& .\Audit-Evtx-11.4.ps1 -InputPath D:\Выгрузки -OutputPath D:\Отчеты -StartTime '2026-09-01'
 
 .EXAMPLE
-& .\Audit-Evtx-11.3.ps1 -InputPath D:\Выгрузки -SigmaRulesPath D:\sigma\rules\windows\builtin
+& .\Audit-Evtx-11.4.ps1 -InputPath D:\Выгрузки -SigmaRulesPath D:\sigma\rules\windows\builtin
 
 .NOTES
 См. README.md: семантика, ограничения и статус проверки.
@@ -92,12 +92,12 @@ param(
     [switch]$NoSigma,
     [switch]$NoCompiledEngine,
     [switch]$AttackTriage,
-    [string]$ExtraAvFilePattern = '(?i)(doctor[ ._-]*web|dr[ ._-]*web|kaspersky|eset|symantec|sophos|mcafee|trend.?micro)',
+    [string]$ExtraAvFilePattern = '(?i)(doctor[ ._-]*web|dr[ ._-]*web|kaspersky|(?<![a-z])eset|symantec|sophos|mcafee|trend.?micro)',
     [switch]$SelfTest
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$script:Version = '11.3.0'
+$script:Version = '11.4.0'
 $script:Utf8 = New-Object System.Text.UTF8Encoding($true)
 $script:Invariant = [Globalization.CultureInfo]::InvariantCulture
 # Time zone for the "(местное)" columns: -DisplayTimeZone (Windows id, e.g. 'Russian Standard Time') or this computer's zone.
@@ -646,7 +646,7 @@ function Match-Event($e, [bool]$VendorFile) {
             if ($null -eq $r) { return }
             $lt=$e.LogonType
             if ($lt -eq '10') { $r.Title += ' (RemoteInteractive, тип 10)' }
-            elseif ($IncludeNetworkLogons -and $e.Id -eq 4624 -and $lt -in @('3','8')) {
+            elseif ($IncludeNetworkLogons -and $e.Id -eq 4624 -and $lt -eq '3') {
                 $r.Title = 'Сетевой вход, тип ' + $lt
                 $r.Note = 'Сетевой доступ: возможны SMB, WinRM, службы и другие механизмы; не доказательство RDP.'
             } elseif ($e.Id -eq 4624 -and $lt -in @('2','11')) {
@@ -789,8 +789,9 @@ function Build-Query([string]$Path, [bool]$VendorFile, [bool]$SkipSigma=$false) 
     if (-not $SkipSigma -and $script:SigmaSelectors.Count -gt 0) {
         # Kaspersky rules match the event text, not IDs: read the Kaspersky channels and
         # providers whole, and KES 11-12 codes from Application whatever the provider name.
-        foreach ($name in $script:KasperskyChannels) { $selectors.Add("*[System[Channel='$name'$time]]") }
-        foreach ($name in $script:KasperskyProviders) { $selectors.Add("*[System[Provider[@Name='$name']$time]]") }
+        # Few selectors: every Select adds to the Windows query complexity limit.
+        $selectors.Add('*[System[('+((@($script:KasperskyChannels) | ForEach-Object { "Channel='$_'" }) -join ' or ')+")$time]]")
+        $selectors.Add('*[System[Provider['+((@($script:KasperskyProviders) | ForEach-Object { "@Name='$_'" }) -join ' or ')+"]$time]]")
         for ($i=0; $i -lt $script:KasperskyIds.Count; $i+=8) {
             $last=[Math]::Min($i+7,$script:KasperskyIds.Count-1)
             $selectors.Add("*[System[Channel='Application' and ("+((@($script:KasperskyIds[$i..$last]) | ForEach-Object { 'EventID='+$_ }) -join ' or ')+")$time]]")
@@ -807,6 +808,13 @@ function Build-Query([string]$Path, [bool]$VendorFile, [bool]$SkipSigma=$false) 
     [void]$xml.Append('</Query></QueryList>')
     $script:QueryCache[$queryKey]=$xml.ToString()
     return $script:QueryCache[$queryKey]
+}
+# Records in an EVTX: Record IDs are consecutive within one log, so the span of the first
+# and last record is the record count (approximate if the log was cleared mid-file).
+function Get-RecordSpan([string]$First,[string]$Last) {
+    $a=[long]0; $b=[long]0
+    if (-not [long]::TryParse($First,[ref]$a) -or -not [long]::TryParse($Last,[ref]$b) -or $b -lt $a) { return '' }
+    return [string]($b-$a+1)
 }
 function Log-Issue([string]$Stage,[string]$Path,[string]$RecordId,[string]$Text) {
     $script:IssueCount++
@@ -1677,7 +1685,7 @@ namespace __NS__
 
     public sealed class Engine : IDisposable
     {
-        public const string Version = "11.3.0";
+        public const string Version = "11.4.0";
         // Configuration (set by PowerShell before Open()).
         public bool IncludeNoise, IncludeNetworkLogons, DeepScriptScan, IncludeProcessCreation, IncludeAllAntivirusEvents, GenericErrors, SkipCorrelation, KeepEvidence;
         public int MaxEventId = 10000, FailureThreshold = 10, WindowMinutes = 10, SprayUserThreshold = 5, RowsPerCsv = 500000;
@@ -1873,7 +1881,7 @@ namespace __NS__
                     if (r == null) return null;
                     string lt = e.LogonType;
                     if (U.EqI(lt, "10")) r.Title += " (RemoteInteractive, тип 10)";
-                    else if (IncludeNetworkLogons && e.Id == 4624 && (lt == "3" || lt == "8"))
+                    else if (IncludeNetworkLogons && e.Id == 4624 && lt == "3")
                     {
                         r.Title = "Сетевой вход, тип " + lt;
                         r.Note = "Сетевой доступ: возможны SMB, WinRM, службы и другие механизмы; не доказательство RDP.";
@@ -4162,10 +4170,12 @@ namespace __NS__
             string titleText = string.Join(" | ", titles.ToArray());
             string user = ViolationUser(e);
             string details = Details(e, rules);
-            // The same violation repeated within a minute (bursts, several log sources) is one row.
+            // The same violation repeated within a minute of the row's first event (bursts,
+            // several log sources) is one row. Not chained: a program that repeats the action
+            // every few seconds for hours gives one row per minute, not one row in total.
             string key = e.Computer.ToLowerInvariant() + "\u001f" + titleText + "\u001f" + user + "\u001f" + details;
             ViolationRow last;
-            if (lastViolation.TryGetValue(key, out last) && e.Ticks >= last.LastTicks && e.Ticks - last.LastTicks <= 60 * TimeSpan.TicksPerSecond)
+            if (lastViolation.TryGetValue(key, out last) && e.Ticks >= last.LastTicks && e.Ticks - last.Ticks <= 60 * TimeSpan.TicksPerSecond)
             {
                 last.Repeats++; last.LastTicks = e.Ticks;
                 return;
@@ -4421,6 +4431,43 @@ detection:
 falsepositives:
     - Согласованная корректировка часов администратором (должна быть в журнале работ)
 level: high
+---
+title: Системное время изменено программой (журнал System)
+id: b0437b23-e836-5b1e-883d-df4fe4fd45f6
+status: experimental
+description: Событие Kernel-General 1 называет процесс, изменивший время (Windows 10 / Server 2016 и новее). Срабатывает, если это не служба синхронизации — например, панель «Дата и время», команды date/time или Set-Date. Дублирует Security 4616, но журнал System обычно хранится дольше.
+author: EVTX Audit
+date: 2026-10-21
+tags:
+    - attack.defense-evasion
+    - attack.t1070.006
+evtxa_group: Изменение времени
+fstec239: [АУД]
+fields:
+    - Было=OldTime
+    - Стало=NewTime
+    - Процесс=ProcessName
+logsource:
+    product: windows
+    service: system
+detection:
+    selection:
+        Provider_Name: 'Microsoft-Windows-Kernel-General'
+        EventID: 1
+        ProcessName|contains: '.exe'
+    filter_sync:
+        ProcessName|endswith:
+            - '\svchost.exe'
+            - '\w32tm.exe'
+            - '\vmtoolsd.exe'
+            - '\VBoxService.exe'
+            - '\prl_tools_service.exe'
+            - '\ntpd.exe'
+            - '\vmicsvc.exe'
+    condition: selection and not filter_sync
+falsepositives:
+    - Сторонний клиент синхронизации времени (добавьте его в исключения)
+level: medium
 ---
 title: Создана учетная запись
 id: 8b84d11d-9f3c-5efb-bfd0-209e3590b937
@@ -4836,6 +4883,98 @@ detection:
     condition: selection
 level: high
 ---
+title: Включена встроенная учетная запись Администратор
+id: 91a954ca-ba74-5821-b4c8-c869e307a2e6
+status: experimental
+description: Включена встроенная учетная запись Администратор (RID 500) — общая учетная запись без персональной ответственности; обычно должна быть отключена.
+author: EVTX Audit
+date: 2026-10-21
+tags:
+    - attack.persistence
+    - attack.t1078.001
+evtxa_group: Учетные записи
+fstec239: [ИАФ, УПД]
+fields:
+    - УЗ=TargetUserName
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4722
+        TargetSid|endswith: '-500'
+    condition: selection
+falsepositives:
+    - Аварийное восстановление доступа по заявке
+level: high
+---
+title: Создана или удалена группа безопасности
+id: bcbbf5b4-e30b-5506-89c0-f416d9d0e158
+status: experimental
+description: Создана или удалена локальная или доменная группа безопасности. Через новые группы права раздаются в обход согласованной ролевой модели.
+author: EVTX Audit
+date: 2026-10-21
+tags:
+    - attack.persistence
+    - attack.t1098
+evtxa_group: Права и группы
+fstec239: [УПД]
+fields:
+    - Группа=TargetUserName
+    - Домен=TargetDomainName
+    - SID группы=TargetSid
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID:
+            - 4727
+            - 4730
+            - 4731
+            - 4734
+            - 4754
+            - 4758
+    condition: selection
+falsepositives:
+    - Установка ПО, создающего свои группы (SQL Server, SCADA), администрирование домена
+level: medium
+---
+title: Изменена политика паролей или блокировки учетных записей
+id: 4bd363e4-3ec1-5d85-afce-c7f4ce9e4b75
+status: experimental
+description: Изменены длина, срок действия, история паролей или порог блокировки — требования к паролям ослаблены или ужесточены не через согласованную групповую политику.
+author: EVTX Audit
+date: 2026-10-21
+tags:
+    - attack.defense-evasion
+    - attack.t1556
+evtxa_group: Учетные записи
+fstec239: [ИАФ]
+fields:
+    - Что изменено=DomainPolicyChanged
+    - Мин. длина=MinPasswordLength
+    - Макс. срок=MaxPasswordAge
+    - История=PasswordHistoryLength
+    - Порог блокировки=LockoutThreshold
+    - Свойства пароля=PasswordProperties
+    - Кто=SubjectUserName
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4739
+    filter_system:
+        SubjectUserSid:
+            - 'S-1-5-18'
+            - 'S-1-5-19'
+            - 'S-1-5-20'
+    condition: selection and not filter_system
+level: high
+---
 title: Добавление в группу администраторов
 id: f33f5a02-e712-5f2e-957a-438f0573a3a3
 status: stable
@@ -5101,10 +5240,10 @@ falsepositives:
     - Подключение сетевых дисков с другими учетными данными, задания с сохраненным паролем
 level: low
 ---
-title: Вход вне разрешенного времени или с неразрешенного компьютера
-id: 79a10fa8-b7d6-5333-9bc8-35a95d436f11
+title: Отказ во входе — ограничения УЗ, отключенная или просроченная УЗ
+id: cbe0547e-c72f-5a4e-9e97-f0ff4c30f7d5
 status: stable
-description: Отказ во входе из-за ограничений учетной записи (часы входа, список рабочих станций) или под отключенной, просроченной учетной записью.
+description: Отказ во входе из-за ограничений учетной записи (часы входа, список рабочих станций, запрещенный тип входа) или под отключенной, просроченной УЗ либо с истекшим паролем — кто-то пользуется чужой или старой учетной записью. Код — в «Подстатусе»: 0xc000006f часы, 0xc0000070 станция, 0xc0000072 УЗ отключена, 0xc0000193 УЗ просрочена, 0xc0000071 пароль истек, 0xc000015b тип входа не разрешен.
 author: EVTX Audit
 date: 2026-10-14
 evtxa_group: Входы в систему
@@ -5125,6 +5264,7 @@ detection:
             - '0xc0000070'
             - '0xc0000072'
             - '0xc0000193'
+            - '0xc0000071'
             - '0xc000015b'
     condition: selection
 level: medium
@@ -5132,7 +5272,7 @@ level: medium
 title: Вход с паролем в открытом виде (тип 8)
 id: 68315eb0-d162-549c-8297-a8d1bc839968
 status: stable
-description: Пароль передан серверу в открытом виде (NetworkCleartext).
+description: Программа или служба получила логин и пароль как есть и проверила их через Windows (NetworkCleartext) — IIS с Basic-аутентификацией, веб-интерфейсы, LDAP simple bind, скрипты с паролем в настройках. По процессу и IP определите источник; пароль, хранящийся или передаваемый открыто, — нарушение.
 author: EVTX Audit
 date: 2026-10-14
 evtxa_group: Входы в систему
@@ -5149,7 +5289,7 @@ detection:
         EventID: 4624
         LogonType: 8
     condition: selection
-level: low
+level: medium
 ---
 title: Подключен съемный накопитель (USB, SD)
 id: 053f7a36-0d06-5d60-af3f-1da60981e2b1
@@ -5275,6 +5415,35 @@ detection:
         EventID: 6423
     condition: selection
 level: high
+---
+title: Подключено Bluetooth-устройство
+id: 3e6aac40-57cf-511a-9ae9-abd9f970217c
+status: experimental
+description: Впервые подключено (сопряжено) устройство Bluetooth — телефон, гарнитура, клавиатура, адаптер. Через Bluetooth возможна передача файлов в обход контроля съемных носителей.
+author: EVTX Audit
+date: 2026-10-21
+tags:
+    - attack.exfiltration
+    - attack.t1011
+evtxa_group: Сеть и периферия
+fstec239: [ЗИС, ЗНИ]
+fields:
+    - Устройство=DeviceInstanceId
+    - Драйвер=DriverName
+logsource:
+    product: windows
+    service: kernel-pnp-configuration
+detection:
+    selection:
+        EventID: 400
+        DeviceInstanceId|startswith:
+            - 'BTHENUM\'
+            - 'BTHLE\'
+            - 'BTHLEDEVICE\'
+    condition: selection
+falsepositives:
+    - Штатные беспроводные клавиатуры и мыши
+level: medium
 ---
 title: Подключение к сети Wi-Fi
 id: 31f9c6c6-d2c6-56a4-a737-b2af5aa5a079
@@ -7733,23 +7902,6 @@ correlation:
         gte: 3
 level: high
 ---
-title: Многократное обнаружение угроз на компьютере
-id: 1d6d15dd-3f70-552f-9d43-d3e4f4cb4691
-status: experimental
-description: За час антивирус 5 и более раз обнаружил угрозы на одном компьютере — зараженный носитель, активное заражение или распространение ВПО по сети.
-author: EVTX Audit
-date: 2026-10-15
-evtxa_group: Средства защиты
-fstec239: [АВЗ]
-correlation:
-    type: event_count
-    rules:
-        - evtxa_av_detection
-    timespan: 1h
-    condition:
-        gte: 5
-level: high
----
 title: Выключение защиты → подключение носителя
 id: 3e46feb8-4cb8-5dbb-94ff-327e58edff2f
 status: experimental
@@ -8164,7 +8316,7 @@ function New-RunSummaryCsv([string]$WorkPath) {
 # Excel layout: sheet order, numeric columns, widths, wrapping, hidden technical
 # columns and priority colors. Kept separate from COM so SelfTest can check it.
 $script:NumericHeaders=[Collections.Generic.HashSet[string]]::new([string[]]@('Оценка риска','Связанных уникальных событий','Сценариев','Количество','Событий в окне','Разных УЗ',
-    'Сеансов (пар)','Суммарная длительность, сек','Длительность, сек','Номер','Находок','Прочитано подходящих событий','Ошибок разбора','Нет описания Windows','Размер, байт','Время обработки, сек',
+    'Сеансов (пар)','Суммарная длительность, сек','Длительность, сек','Номер','Находок','Прочитано подходящих событий','Записей в файле (по Record ID)','Ошибок разбора','Нет описания Windows','Размер, байт','Время обработки, сек',
     'КИ P1','КИ P2','Срабатываний Sigma','Правил Sigma','Успешных входов','Неудачных входов','RDP-сеансов','Съемных носителей','Изменений ПО','Изменений УЗ','Очисток журналов','Аварийных перезагрузок',
     'Глубина Security, дней','Событий','Компьютеров','Подключений (оценка)','Емкость, ГБ',
     'Нарушений всего','Критических и высоких','Средних','Низких','Цепочек','Повторов'))
@@ -10585,7 +10737,7 @@ function Test-V112Kaspersky {
         $vendor=Build-Query 'C:\Logs\Kaspersky Event Log.evtx' $true
         $doc=New-Object Xml.XmlDocument; $doc.LoadXml($query)
         $selects=(@($doc.SelectNodes('//Select') | ForEach-Object { $_.InnerText }) -join "`n")
-        Assert-True ($selects.Contains("Channel='Kaspersky Event Log'") -and $selects.Contains("Provider[@Name='avp']") -and $selects.Contains("Channel='Application' and (EventID=") -and $selects.Contains('EventID=302') -and
+        Assert-True ($selects.Contains("Channel='Kaspersky Event Log'") -and $selects.Contains("@Name='avp' or") -and $selects.Contains("Channel='Application' and (EventID=") -and $selects.Contains('EventID=302') -and
             -not $vendor.Contains('EventID&lt;=')) 'Kaspersky: channels, providers and KES codes in the Windows query; AV logs without the Event ID limit'
         $kel='Kaspersky Event Log'; $op='S-1-5-21-1-2-3-1100'; $nl="`r`n"
         $kav={ param($Time,[string[]]$Lines,$Provider='KES',$Id=1) New-V10Event $Provider $Id $Time $kel @(($Lines -join $nl)) '0x80000000000000' 'S-1-5-18' }
@@ -10637,7 +10789,62 @@ function Test-V112Kaspersky {
         Assert-True (@(& $row '*Удален антивирус Касперского*').Count -eq 1 -and $svc.Count -eq 1 -and $svc[0].'Пользователь' -eq 'WS01\operator (S-1-5-21-1-2-3-1100)' -and @(& $row 'Антивирус выключен (Центр безопасности Windows)').Count -eq 1) 'Kaspersky: uninstall, service disabled, Security Center (not Defender)'
         Assert-True ($viol.Count -eq 16 -and $count -eq 16 -and @($viol | Where-Object { $_.'Детали' -like '*обновлены*' -or $_.'Детали' -like '*Угроз не обнаружено*' -or $_.'Детали' -like '*Задача запущена*' }).Count -eq 0) ('Kaspersky: '+$viol.Count+' violation rows, updates, clean scans and tasks are not violations')
         $titles=@($alerts | ForEach-Object { $_.'Правило' })
-        foreach ($expected in @('Многократное обнаружение угроз на компьютере','Выключение защиты → подключение носителя','Обнаружение угрозы после подключения носителя')) { Assert-True ($expected -in $titles) ('Kaspersky chain: '+$expected) }
+        foreach ($expected in @('Повторное обнаружение вредоносного ПО на компьютере','Выключение защиты → подключение носителя','Обнаружение угрозы после подключения носителя')) { Assert-True ($expected -in $titles) ('Kaspersky chain: '+$expected) }
+    } finally {
+        foreach ($k in $saved.Keys) { Set-Variable -Scope Script -Name $k -Value $saved[$k] }
+        foreach ($w in @($script:Writers)) { try { $w.Dispose() } catch { } }
+        $script:Writers.Clear()
+        Remove-Item -LiteralPath $root -Recurse -Force
+    }
+}
+# v11.4: account and policy rules, time change in System, Bluetooth, cleartext logon,
+# violation rows merged only within a minute of the first event.
+function Test-V114Rules {
+    if ($NoCompiledEngine) { Write-Host 'v11.4 rule tests skipped: -NoCompiledEngine'; return }
+    $null=Get-EngineType
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('EvtxAudit-V114-'+[guid]::NewGuid().ToString('N'))
+    $dir=Join-Path $root 'r'; [void][IO.Directory]::CreateDirectory($dir)
+    $evtx=Join-Path $root 'WS01\Security.evtx'
+    $saved=@{}
+    foreach ($name in @('RunPath','SpoolPath','Part','PartRows','Summary','LogonAgg','FindingCount','BurstCount','RdpCount','RdpTotals','RdpClosed','RdpWriter','BurstWriter','ErrorWriter','SigmaSelectors','QueryCache')) { $saved[$name]=Get-Variable -Scope Script -Name $name -ValueOnly -ErrorAction SilentlyContinue }
+    try {
+        $script:ErrorWriter=New-Writer (Join-Path $root 'Errors.csv'); Write-Row $script:ErrorWriter @('Время UTC','Этап','Файл источника','Record ID','Ошибка')
+        $sigma=New-SigmaEngine @()
+        $sec='Microsoft-Windows-Security-Auditing'; $admin='S-1-5-21-1-2-3-1000'
+        $subject=[ordered]@{SubjectUserSid=$admin;SubjectUserName='admin';SubjectDomainName='WS01';SubjectLogonId='0xa1'}
+        $with={ param($extra) $d=[ordered]@{}; foreach ($k in $subject.Keys) { $d[$k]=$subject[$k] }; foreach ($k in $extra.Keys) { $d[$k]=$extra[$k] }; $d }
+        $script:V10Rid=0
+        $l=New-Object 'System.Collections.Generic.List[string]'
+        $l.Add((New-V10Event $sec 4722 '08:00:00' 'Security' (& $with ([ordered]@{TargetUserName='Administrator';TargetDomainName='WS01';TargetSid='S-1-5-21-1-2-3-500'}))))
+        $l.Add((New-V10Event $sec 4731 '08:01:00' 'Security' (& $with ([ordered]@{TargetUserName='SCADA_Admins';TargetDomainName='WS01';TargetSid='S-1-5-21-1-2-3-1600'}))))
+        $l.Add((New-V10Event $sec 4739 '08:02:00' 'Security' (& $with ([ordered]@{DomainPolicyChanged='Password Policy';DomainName='WS01';MinPasswordLength='0';MaxPasswordAge='-';PasswordHistoryLength='-';LockoutThreshold='-'}))))
+        $l.Add((New-V10Event $sec 4739 '08:02:30' 'Security' ([ordered]@{SubjectUserSid='S-1-5-18';SubjectUserName='WS01$';DomainPolicyChanged='Password Policy'})))
+        $l.Add((New-V10Event $sec 4625 '08:03:00' 'Security' ([ordered]@{SubjectUserSid='S-1-5-18';TargetUserSid='S-1-0-0';TargetUserName='old_engineer';TargetDomainName='WS01';Status='0xc000006e';SubStatus='0xc0000071';LogonType='2';IpAddress='127.0.0.1'}) '0x8010000000000000'))
+        $l.Add((New-V10Event 'Microsoft-Windows-Kernel-General' 1 '08:04:00' 'System' ([ordered]@{NewTime='2026-03-01T08:04:00.0000000Z';OldTime='2026-03-02T08:04:00.0000000Z';Reason='1';ProcessName='\Device\HarddiskVolume2\Windows\System32\rundll32.exe';ProcessID='4321'}) '0x8000000000000010' 'S-1-5-21-1-2-3-1100'))
+        $l.Add((New-V10Event 'Microsoft-Windows-Kernel-General' 1 '08:05:00' 'System' ([ordered]@{NewTime='2026-03-02T08:05:00.0100000Z';OldTime='2026-03-02T08:05:00.0000000Z';Reason='2';ProcessName='\Device\HarddiskVolume2\Windows\System32\svchost.exe';ProcessID='1540'}) '0x8000000000000010' 'S-1-5-19'))
+        $l.Add((New-V10Event 'Microsoft-Windows-Kernel-PnP' 400 '08:06:00' 'Microsoft-Windows-Kernel-PnP/Configuration' ([ordered]@{DeviceInstanceId='BTHENUM\{0000110a-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002\7&1A2B3C4D&0&AABBCCDDEEFF_C00000000';DriverName='bth.inf'}) '0x4000000000000000' 'S-1-5-18'))
+        # A program with a cleartext password every 30 s for 3 minutes: 3 rows (one per minute), not one.
+        for ($i=0; $i -lt 7; $i++) {
+            $t=[TimeSpan]::FromSeconds(9*3600+30*$i)
+            $l.Add((New-V10Event $sec 4624 ('{0:hh\:mm\:ss}' -f $t) 'Security' ([ordered]@{SubjectUserSid='S-1-5-18';TargetUserSid='S-1-5-21-1-2-3-1700';TargetUserName='svc_hmi';TargetDomainName='WS01';TargetLogonId=('0x'+(700+$i));LogonType='8';LogonProcessName='Advapi  ';AuthenticationPackageName='Negotiate';ProcessName='C:\Windows\System32\inetsrv\w3wp.exe';IpAddress='10.0.0.20';IpPort='50000'})))
+        }
+        $c=Invoke-V10Engine $dir $evtx $l $sigma
+        $vw=New-Writer (Join-Path $dir 'Violations.csv')
+        try { [void]$sigma.WriteViolations($vw,[string]$Delimiter) } finally { Close-Writer $vw }
+        $viol=@(Import-Csv -LiteralPath (Join-Path $dir 'Violations.csv') -Delimiter $Delimiter -Encoding UTF8)
+        $row={ param($Like) @($viol | Where-Object { $_.'Нарушение' -like $Like }) }
+        Assert-True (@(& $row '*Включена встроенная учетная запись Администратор*').Count -eq 1 -and @(& $row '*Включена встроенная учетная запись Администратор*')[0].'Уровень' -eq 'Высокий') 'v11.4: built-in Administrator enabled'
+        Assert-True (@(& $row 'Создана или удалена группа безопасности').Count -eq 1 -and @(& $row 'Создана или удалена группа безопасности')[0].'Детали' -like 'Группа: SCADA_Admins*') 'v11.4: security group created'
+        $policy=@(& $row 'Изменена политика паролей или блокировки учетных записей')
+        Assert-True ($policy.Count -eq 1 -and $policy[0].'Детали' -like '*Мин. длина: 0*' -and $policy[0].'Пользователь' -eq 'WS01\admin') 'v11.4: password policy changed by a user, not by SYSTEM'
+        Assert-True (@(& $row 'Отказ во входе*').Count -eq 1 -and @(& $row 'Отказ во входе*')[0].'Детали' -like '*0xc0000071*') 'v11.4: logon refused, expired password'
+        $time=@(& $row 'Системное время изменено программой*')
+        Assert-True ($time.Count -eq 1 -and $time[0].'Детали' -like '*rundll32.exe*' -and $time[0].'Группа' -eq 'Изменение времени') 'v11.4: time change in System by a program, time service ignored'
+        Assert-True (@(& $row 'Подключено Bluetooth-устройство').Count -eq 1) 'v11.4: Bluetooth device'
+        $clear=@(& $row 'Вход с паролем в открытом виде (тип 8)')
+        Assert-True ($clear.Count -eq 3 -and $clear[0].'Уровень' -eq 'Средний' -and $clear[0].'Повторов' -eq '3' -and (@($clear | ForEach-Object { [int]$_.'Повторов' }) | Measure-Object -Sum).Sum -eq 7 -and $clear[0].'Детали' -like '*w3wp.exe*') 'v11.4: cleartext logons, rows merged only within a minute of the first event'
+        $findings=@(Import-Csv -LiteralPath (Join-Path $dir 'Findings-0001.csv') -Delimiter $Delimiter -Encoding UTF8 | Where-Object { $_.'Event ID' -eq '4624' })
+        Assert-True ($findings.Count -eq 7 -and @($findings | Where-Object { $_.'Событие' -eq 'Вход с паролем в открытом виде (тип 8)' }).Count -eq 7) 'v11.4: every cleartext logon is a finding'
     } finally {
         foreach ($k in $saved.Keys) { Set-Variable -Scope Script -Name $k -Value $saved[$k] }
         foreach ($w in @($script:Writers)) { try { $w.Dispose() } catch { } }
@@ -10662,6 +10869,7 @@ if ($SelfTest) {
     Test-V92Pipeline
     Test-V10
     Test-V112Kaspersky
+    Test-V114Rules
     Write-Host ('ALL SELFTESTS PASSED — version '+$script:Version)
     } finally { $script:HashEngine.Dispose() }
     return
@@ -10692,7 +10900,7 @@ $script:Part=0; $script:PartRows=0; $script:FindingWriter=$null; $script:Evidenc
 $script:ErrorWriter=New-Writer (Join-Path $script:RunPath 'Errors.csv')
 Write-Row $script:ErrorWriter @('Время UTC','Этап','Файл источника','Record ID','Ошибка')
 $inventoryWriter=New-Writer (Join-Path $script:RunPath 'Files.csv')
-Write-Row $inventoryWriter @('Полный путь','Размер, байт','Изменен UTC','SHA256 файла','Статус обработки','Прочитано подходящих событий','Находок','Ошибок разбора','Нет описания Windows','Время первой записи UTC','Время последней записи UTC','Каналы','Компьютеры','Способ отбора','Комментарий','Время обработки, сек')
+Write-Row $inventoryWriter @('Полный путь','Размер, байт','Изменен UTC','SHA256 файла','Статус обработки','Прочитано подходящих событий','Находок','Ошибок разбора','Нет описания Windows','Время первой записи UTC','Время последней записи UTC','Каналы','Компьютеры','Способ отбора','Комментарий','Время обработки, сек','Записей в файле (по Record ID)')
 $script:RdpWriter=New-Writer (Join-Path $script:RunPath 'RdpIntervals.csv')
 Write-Row $script:RdpWriter $script:RdpHeaders
 $script:BurstWriter=New-Writer (Join-Path $script:RunPath 'AuthBursts.csv')
@@ -10740,7 +10948,7 @@ $metadata=[ordered]@{ScriptVersion=$script:Version;StartedUtc=$started.ToString(
 try {
     $discoveryErrors=@()
     if ($inputItem.PSIsContainer) {
-        $files=@(Get-ChildItem -LiteralPath $inputItem.FullName -Filter '*.evtx' -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable discoveryErrors | Sort-Object FullName)
+        $files=@(Get-ChildItem -LiteralPath $inputItem.FullName -Filter '*.evtx' -File -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable discoveryErrors | Sort-Object FullName)
     } else { $files=@($inputItem) }
     foreach ($err in $discoveryErrors) { Log-Issue 'Discovery' $inputItem.FullName '' $err.ToString() }
     if ($files.Count -eq 0) { throw 'Доступные .evtx не найдены. Проверьте InputPath и отчет об ошибках.' }
@@ -10756,7 +10964,7 @@ try {
         if ($script:GenericErrors) { $note='Отбор через Windows API выполнен; читаются только записи по правилам и Critical/Error.'; $selectionMethod='Правила + Critical/Error' }
         else { $note='Отбор через Windows API выполнен; читаются только записи по правилам (общий отбор Critical/Error выключен, см. -IncludeAllErrors).'; $selectionMethod='Правила' }
         if ($script:HasStart -or $script:HasEnd) { $note+=' Задан период -StartTime/-EndTime: события вне периода не читались.' }
-        $first=''; $last=''; $reader=$null; $filteredError=''; $state=@{}; $spoolWriters=@{}; $lastTimes=@{}; $script:RdpClosed=@{}
+        $first=''; $last=''; $firstRid=''; $lastRid=''; $reader=$null; $filteredError=''; $readErrors=0; $state=@{}; $spoolWriters=@{}; $lastTimes=@{}; $script:RdpClosed=@{}
         $channels=New-Object 'System.Collections.Generic.HashSet[string]'
         $computers=New-Object 'System.Collections.Generic.HashSet[string]'
         $xmlRecovered=0
@@ -10786,7 +10994,7 @@ try {
                     $boundary=$boundaryReader.ReadEvent()
                     if ($boundary) {
                         $b=Parse-Event $boundary.ToXml()
-                        if ($reverse) { $last=$b.TimeUtc } else { $first=$b.TimeUtc }
+                        if ($reverse) { $last=$b.TimeUtc; $lastRid=[string]$b.RecordId } else { $first=$b.TimeUtc; $firstRid=[string]$b.RecordId }
                         [void]$channels.Add($b.Channel); [void]$computers.Add($b.Computer)
                     }
                 } catch { Log-Issue 'BoundaryRead' $file.FullName '' $_.Exception.Message; $status='Partial' }
@@ -10833,10 +11041,18 @@ try {
                 }
             }
             if ($reader) {
+                $readErrors=0; $readErrorRun=0
                 while ($true) {
                     $record=$null
-                    try { $record=$reader.ReadEvent() }
-                    catch { Log-Issue 'ReadEvent' $file.FullName '' $_.Exception.Message; $status='Partial'; $note='Чтение прервано; оставшиеся события этого файла НЕ проверены.'; break }
+                    # v11.4: one damaged record (a log copied from a running computer) no longer
+                    # ends the file: reading continues; only a long run of failures stops it.
+                    try { $record=$reader.ReadEvent(); $readErrorRun=0 }
+                    catch {
+                        $readErrors++; $readErrorRun++; $status='Partial'
+                        if ($readErrors -le 20) { Log-Issue 'ReadEvent' $file.FullName '' $_.Exception.Message }
+                        if ($readErrorRun -ge 100) { $note+=' Чтение прервано после 100 нечитаемых записей подряд; оставшиеся события этого файла НЕ проверены.'; break }
+                        continue
+                    }
                     if ($null -eq $record) { break }
                     $selected++; $e=$null; $r=$null
                     if ($script:Engine) {
@@ -10953,12 +11169,13 @@ try {
                 $note+=' Восстановлено XML записей: '+$xmlRecovered+'. Сверить отмеченные данные с исходным EVTX.'
                 Log-Issue 'XmlRecovered' $file.FullName ($xmlRecoveryIds -join ', ') ('Восстановлено записей: '+$xmlRecovered+'. Недопустимые XML-символы заменены видимыми маркерами; EVTX не изменен. Record ID — до 10 примеров.')
             }
+            if ($readErrors -gt 0) { $note+=' Нечитаемых записей пропущено: '+$readErrors+' (журнал поврежден или скопирован с работающего компьютера); остальные записи проверены.' }
             if ($status -eq 'OK' -and $selected -eq 0) { $status='NoCandidates'; $note='Записей, подходящих под правила, не найдено. Это НЕ доказывает отсутствие инцидентов.' }
             if ($messageMissing -gt 0) { $note+=' Часть описаний провайдеров недоступна; анализ выполнен по XML.' }
             if ($vendorFile) { $note+=' Для журнала стороннего антивируса прочитаны все события, но в находки попали только угрозы/ошибки или все события при -IncludeAllAntivirusEvents.' }
             $fileStopwatch.Stop()
             Write-Host ('  Завершено: {0:N1} сек.; прочитано {1}; находок {2}; режим: {3}' -f $fileStopwatch.Elapsed.TotalSeconds,$selected,($script:FindingCount-$before),$selectionMethod)
-            Write-Row $inventoryWriter @($file.FullName,$file.Length,$file.LastWriteTimeUtc.ToString('o'),$hash,(Ru-FileStatus $status),$selected,($script:FindingCount-$before),$parseErrors,$messageMissing,$first,$last,([string]::Join(' | ',[string[]]@($channels))),([string]::Join(' | ',[string[]]@($computers))),$(if($vendorFile){'Все события антивируса'}else{$selectionMethod}),$note,[Math]::Round($fileStopwatch.Elapsed.TotalSeconds,1))
+            Write-Row $inventoryWriter @($file.FullName,$file.Length,$file.LastWriteTimeUtc.ToString('o'),$hash,(Ru-FileStatus $status),$selected,($script:FindingCount-$before),$parseErrors,$messageMissing,$first,$last,([string]::Join(' | ',[string[]]@($channels))),([string]::Join(' | ',[string[]]@($computers))),$(if($vendorFile){'Все события антивируса'}else{$selectionMethod}),$note,[Math]::Round($fileStopwatch.Elapsed.TotalSeconds,1),$(Get-RecordSpan $firstRid $lastRid))
             $inventoryWriter.Flush()
             if ($status -eq 'Warning') { $warningFiles++ }
             if ($status -in @('Partial','Failed')) { $failedFiles++ }
