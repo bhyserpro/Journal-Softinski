@@ -46,13 +46,13 @@ rules/windows/builtin). Поддерживаемое подмножество о
 Только самопроверка (журналы не читаются).
 
 .EXAMPLE
-& .\Audit-Evtx-11.5.ps1 -SelfTest
+& .\Audit-Evtx-11.6.ps1 -SelfTest
 
 .EXAMPLE
-& .\Audit-Evtx-11.5.ps1 -InputPath D:\Выгрузки -OutputPath D:\Отчеты -StartTime '2026-09-01'
+& .\Audit-Evtx-11.6.ps1 -InputPath D:\Выгрузки -OutputPath D:\Отчеты -StartTime '2026-09-01'
 
 .EXAMPLE
-& .\Audit-Evtx-11.5.ps1 -InputPath D:\Выгрузки -SigmaRulesPath D:\sigma\rules\windows\builtin
+& .\Audit-Evtx-11.6.ps1 -InputPath D:\Выгрузки -SigmaRulesPath D:\sigma\rules\windows\builtin
 
 .NOTES
 См. README.md: семантика, ограничения и статус проверки.
@@ -97,7 +97,7 @@ param(
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$script:Version = '11.5.0'
+$script:Version = '11.6.0'
 $script:Utf8 = New-Object System.Text.UTF8Encoding($true)
 $script:Invariant = [Globalization.CultureInfo]::InvariantCulture
 # Time zone for the "(местное)" columns: -DisplayTimeZone (Windows id, e.g. 'Russian Standard Time') or this computer's zone.
@@ -657,9 +657,9 @@ function Match-Event($e, [bool]$VendorFile) {
                 $r.Title = 'Вход с новыми учетными данными (тип 9)'
                 $r.Note = 'runas /netonly или подстановка учетных данных. LogonProcessName seclogo с пакетом Negotiate характерен для Pass-the-Hash / Overpass-the-Hash.'
             } elseif ($e.Id -eq 4624 -and $lt -eq '8') {
-                $r.Severity = 'Medium'
+                $r.Severity = 'Low'
                 $r.Title = 'Вход с паролем в открытом виде (тип 8)'
-                $r.Note = 'NetworkCleartext: пароль передан серверу в открытом виде (IIS Basic, отдельные скрипты). Проверить источник и необходимость.'
+                $r.Note = 'NetworkCleartext: программа проверила логин и пароль через Windows (веб-интерфейс SCADA, IIS Basic, LDAP, скрипт). Обычно штатная работа ПО; нарушение — вход с внешнего адреса или пароль, передаваемый по HTTP без шифрования.'
             } else { return }
         }
         if ($r -and $e.Id -in @(4672,4648) -and (Field $d @('SubjectUserSid')) -in @('S-1-5-18','S-1-5-19','S-1-5-20')) {
@@ -1316,6 +1316,8 @@ namespace __NS__
         public readonly List<string> Keys = new List<string>();
         public readonly List<string> Values = new List<string>();
         public readonly Hashtable F = new Hashtable(StringComparer.OrdinalIgnoreCase);
+        // Values computed from other events (Sigma Observe), e.g. Evtxa.SinceCreated.
+        internal Dictionary<string, string> Computed;
         readonly Dictionary<string, int> index = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
         public string GetData(string name)
@@ -1687,7 +1689,7 @@ namespace __NS__
 
     public sealed class Engine : IDisposable
     {
-        public const string Version = "11.5.0";
+        public const string Version = "11.6.0";
         // Configuration (set by PowerShell before Open()).
         public bool IncludeNoise, IncludeNetworkLogons, DeepScriptScan, IncludeProcessCreation, IncludeAllAntivirusEvents, GenericErrors, SkipCorrelation, KeepEvidence;
         public int MaxEventId = 10000, FailureThreshold = 10, WindowMinutes = 10, SprayUserThreshold = 5, RowsPerCsv = 500000;
@@ -1903,9 +1905,9 @@ namespace __NS__
                     }
                     else if (e.Id == 4624 && lt == "8")
                     {
-                        r.Severity = "Medium";
+                        r.Severity = "Low";
                         r.Title = "Вход с паролем в открытом виде (тип 8)";
-                        r.Note = "NetworkCleartext: пароль передан серверу в открытом виде (IIS Basic, отдельные скрипты). Проверить источник и необходимость.";
+                        r.Note = "NetworkCleartext: программа проверила логин и пароль через Windows (веб-интерфейс SCADA, IIS Basic, LDAP, скрипт). Обычно штатная работа ПО; нарушение — вход с внешнего адреса или пароль, передаваемый по HTTP без шифрования.";
                     }
                     else return null;
                 }
@@ -2753,6 +2755,75 @@ namespace __NS__
         }
     }
 
+    // ---------------------------------------------------------------- computed fields
+    // Values the rules need that Windows does not write as a field:
+    //   Evtxa.TimeShift, Evtxa.TimeShiftAbs - seconds from the old to the new system time
+    //     (Security 4616 PreviousTime/NewTime, Kernel-General 1 OldTime/NewTime);
+    //   Evtxa.OtherAccount - "1" when 4648 used the credentials of another account, "0" for
+    //     the same account;
+    //   Evtxa.OldUac, Evtxa.NewUac - UserAccountControl before and after, only when changed;
+    //   Evtxa.SinceCreated - seconds since 4720 created the same account on this computer
+    //     (set by SigmaEngine.Observe on 4738).
+    // null when the event has no such value: a rule condition on it then does not match.
+    internal static class ComputedFields
+    {
+        public static string Get(EvtEvent e, string name)
+        {
+            string v;
+            if (e.Computed != null && e.Computed.TryGetValue(name, out v)) return v;
+            switch (name.ToLowerInvariant())
+            {
+                case "evtxa.timeshift": return TimeShift(e, false);
+                case "evtxa.timeshiftabs": return TimeShift(e, true);
+                case "evtxa.otheraccount": return OtherAccount(e);
+                case "evtxa.olduac": return UacIfChanged(e, "OldUacValue");
+                case "evtxa.newuac": return UacIfChanged(e, "NewUacValue");
+            }
+            return null;
+        }
+        // Old and new UserAccountControl of 4720/4738, only when they differ.
+        static string UacIfChanged(EvtEvent e, string field)
+        {
+            string before = (e.GetData("OldUacValue") ?? "").Trim(), after = (e.GetData("NewUacValue") ?? "").Trim();
+            if (before.Length == 0 || after.Length == 0 || string.Equals(before, after, StringComparison.OrdinalIgnoreCase)) return null;
+            return field == "OldUacValue" ? before : after;
+        }
+        static string TimeShift(EvtEvent e, bool abs)
+        {
+            DateTimeOffset now, before;
+            if (!TryTime(e.GetData("NewTime"), out now)) return null;
+            if (!TryTime(e.GetData("PreviousTime"), out before) && !TryTime(e.GetData("OldTime"), out before)) return null;
+            double seconds = (now.UtcTicks - before.UtcTicks) / (double)TimeSpan.TicksPerSecond;
+            // Full precision for comparisons, three decimals for the report.
+            return abs ? Math.Abs(seconds).ToString("0.#######", CultureInfo.InvariantCulture) : seconds.ToString("0.###", CultureInfo.InvariantCulture);
+        }
+        // ISO 8601 with any number of fraction digits (4616 and Kernel-General 1 write nine).
+        static bool TryTime(string text, out DateTimeOffset value)
+        {
+            value = DateTimeOffset.MinValue;
+            if (string.IsNullOrEmpty(text)) return false;
+            string clean = text.Replace("\u200E", "").Replace("\u200F", "").Trim();
+            return clean.Length > 0 && DateTimeOffset.TryParse(clean, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out value);
+        }
+        static string OtherAccount(EvtEvent e)
+        {
+            string subject = ShortName(e.GetData("SubjectUserName")), target = ShortName(e.GetData("TargetUserName"));
+            if (subject.Length == 0 || target.Length == 0) return null;
+            return string.Equals(subject, target, StringComparison.OrdinalIgnoreCase) ? "0" : "1";
+        }
+        // "DOMAIN\user" and "user@domain" -> "user".
+        static string ShortName(string name)
+        {
+            string n = (name ?? "").Trim();
+            if (n == "-") return "";
+            int slash = n.LastIndexOf('\\');
+            if (slash >= 0) n = n.Substring(slash + 1);
+            int at = n.IndexOf('@');
+            if (at > 0) n = n.Substring(0, at);
+            return n;
+        }
+    }
+
     // ---------------------------------------------------------------- detection tree
     sealed class SCtx
     {
@@ -2771,6 +2842,7 @@ namespace __NS__
                 string kv;
                 return kaspersky.TryGetValue(n.Substring(10), out kv) ? kv : "";
             }
+            if (n.StartsWith("Evtxa.", StringComparison.OrdinalIgnoreCase)) return ComputedFields.Get(E, n);
             switch (n.ToLowerInvariant())
             {
                 case "eventid": return E.Id.ToString(CultureInfo.InvariantCulture);
@@ -3934,6 +4006,22 @@ namespace __NS__
             string subjectSid = e.Get("SubjectUserSid");
             if (subjectSid.StartsWith("S-1-5-21-", StringComparison.OrdinalIgnoreCase) && e.Subject.Length > 0 && !sidNames.ContainsKey(subjectSid)) sidNames[subjectSid] = e.Subject;
             string computer = e.Computer.ToLowerInvariant();
+            if (e.Id == 4720 || e.Id == 4738)
+            {
+                // Windows follows 4720 with 4738 events that only fill in the new account.
+                string sid = e.Get("TargetSid");
+                if (sid.Length > 0)
+                {
+                    string key = computer + "|" + sid.ToUpperInvariant();
+                    long created;
+                    if (e.Id == 4720) createdAccounts[key] = e.Ticks;
+                    else if (createdAccounts.TryGetValue(key, out created) && e.Ticks >= created)
+                    {
+                        if (e.Computed == null) e.Computed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        e.Computed["Evtxa.SinceCreated"] = ((e.Ticks - created) / TimeSpan.TicksPerSecond).ToString(CultureInfo.InvariantCulture);
+                    }
+                }
+            }
             if (e.Id >= 4720 && e.Id <= 4781 && e.Target.Length > 0)
             {
                 string changedSid = e.Get("TargetSid");
@@ -3958,6 +4046,7 @@ namespace __NS__
                 if (ends.Count < 1000) ends.Add(e.Ticks);
             }
         }
+        readonly Dictionary<string, long> createdAccounts = new Dictionary<string, long>(StringComparer.Ordinal);
         string ProbableUser(string computer, long ticks)
         {
             List<Session> list;
@@ -4063,7 +4152,7 @@ namespace __NS__
             if (e.Subject.Length > 0 && !machine) return e.Subject;
             // param1-4 of Service Control Manager are service names and start types.
             bool scm = U.EqI(e.Provider, "Service Control Manager");
-            foreach (string f in new string[] { "User", "param7", "Detection User", "UserName", "Param3" })
+            foreach (string f in new string[] { "User", "param7", "Detection User", "UserName", "Param3", "ModifyingUser" })
             {
                 if (scm && f.StartsWith("param", StringComparison.OrdinalIgnoreCase)) continue;
                 string v = e.GetData(f);
@@ -4110,7 +4199,7 @@ namespace __NS__
                 d[(2080 + i).ToString(CultureInfo.InvariantCulture)] = "+" + flags[i];
                 d[(2048 + i).ToString(CultureInfo.InvariantCulture)] = "−" + flags[i];
             }
-            d["1793"] = "не задано"; d["1794"] = "никогда"; d["1792"] = "никогда";
+            d["1793"] = "не задано"; d["1794"] = "никогда"; d["1792"] = "никогда"; d["1797"] = "все часы";
             return d;
         }
         static string DecodeTokens(string value)
@@ -4407,7 +4496,7 @@ $script:SigmaPack=@'
 title: Системное время изменено пользователем
 id: 8a3a3837-9a4e-5623-a946-3a28b685f2e1
 status: stable
-description: Время изменено не службой синхронизации, а учетной записью пользователя (панель управления, date/time, Set-Date, сторонняя программа). В АСУ ТП смена времени персоналом запрещена — искажается хронология технологических и защитных журналов.
+description: Время изменено не службой синхронизации, а учетной записью пользователя (панель управления, date/time, Set-Date, сторонняя программа). В АСУ ТП смена времени персоналом запрещена — искажается хронология технологических и защитных журналов. Подстройки меньше секунды (программа синхронизации округляет миллисекунды) не считаются; сдвиг — в «Деталях», минус — время переведено назад.
 author: EVTX Audit
 date: 2026-10-14
 tags:
@@ -4420,6 +4509,7 @@ fields:
     - Домен=SubjectDomainName
     - Было=PreviousTime
     - Стало=NewTime
+    - Сдвиг, сек=Evtxa.TimeShift
     - Процесс=ProcessName
 logsource:
     product: windows
@@ -4432,7 +4522,9 @@ detection:
             - 'S-1-5-18'
             - 'S-1-5-19'
             - 'S-1-5-20'
-    condition: selection and not filter_system
+    auto_adjust:
+        Evtxa.TimeShiftAbs|lt: 1
+    condition: selection and not filter_system and not auto_adjust
 falsepositives:
     - Согласованная корректировка часов администратором (должна быть в журнале работ)
 level: high
@@ -4440,7 +4532,7 @@ level: high
 title: Системное время изменено программой (журнал System)
 id: b0437b23-e836-5b1e-883d-df4fe4fd45f6
 status: experimental
-description: Событие Kernel-General 1 называет процесс, изменивший время (Windows 10 / Server 2016 и новее). Срабатывает, если это не служба синхронизации — например, панель «Дата и время», команды date/time или Set-Date. Дублирует Security 4616, но журнал System обычно хранится дольше.
+description: Событие Kernel-General 1 называет процесс, изменивший время (Windows 10 / Server 2016 и новее). Срабатывает, если это не служба синхронизации — например, панель «Дата и время», команды date/time или Set-Date. Дублирует Security 4616, но журнал System обычно хранится дольше. Подстройки меньше секунды не считаются.
 author: EVTX Audit
 date: 2026-10-21
 tags:
@@ -4451,6 +4543,7 @@ fstec239: [АУД]
 fields:
     - Было=OldTime
     - Стало=NewTime
+    - Сдвиг, сек=Evtxa.TimeShift
     - Процесс=ProcessName
 logsource:
     product: windows
@@ -4469,7 +4562,9 @@ detection:
             - '\prl_tools_service.exe'
             - '\ntpd.exe'
             - '\vmicsvc.exe'
-    condition: selection and not filter_sync
+    auto_adjust:
+        Evtxa.TimeShiftAbs|lt: 1
+    condition: selection and not filter_sync and not auto_adjust
 falsepositives:
     - Сторонний клиент синхронизации времени (добавьте его в исключения)
 level: medium
@@ -4617,27 +4712,82 @@ level: high
 title: Изменены параметры учетной записи
 id: 54c06c53-8a27-5626-acc2-f5dc86fc45e1
 status: stable
-description: Изменены атрибуты учетной записи (флаги UserAccountControl, срок действия, путь профиля и т.п.). Событие также сопровождает смену и сброс пароля.
+description: Изменены параметры, влияющие на доступ — флаги учетной записи, срок действия, часы входа, разрешенные компьютеры, сценарий входа, профиль или домашняя папка, основная группа, делегирование, параметры удаленного доступа. В «Деталях» — только то, что изменилось. Не считаются служебные изменения, которые Windows пишет вместе с другими событиями — смена и сброс пароля (дата пароля, «пароль истек»), включение и отключение, блокировка, заполнение параметров только что созданной УЗ (в течение 5 минут после создания) — у них свои правила.
 author: EVTX Audit
-date: 2026-10-14
+date: 2026-10-22
 evtxa_group: Учетные записи
 fstec239: [УПД]
 fields:
     - УЗ=TargetUserName
     - Кто=SubjectUserName
-    - Флаги было=OldUacValue
-    - Флаги стало=NewUacValue
+    - Флаги=UserAccountControl
+    - Флаги было=Evtxa.OldUac
+    - Флаги стало=Evtxa.NewUac
     - Срок действия=AccountExpires
+    - Часы входа=LogonHours
+    - Разрешенные компьютеры=UserWorkstations
+    - Сценарий входа=ScriptPath
+    - Профиль=ProfilePath
+    - Домашняя папка=HomeDirectory
+    - Основная группа (RID)=PrimaryGroupId
+    - Делегирование=AllowedToDelegateTo
+    - UPN=UserPrincipalName
+    - Параметры удаленного доступа=UserParameters
 logsource:
     product: windows
     service: security
 detection:
     selection:
         EventID: 4738
-    condition: selection
+    flags:
+        UserAccountControl|contains:
+            - '%%2049'
+            - '%%2050'
+            - '%%2051'
+            - '%%2053'
+            - '%%2054'
+            - '%%2055'
+            - '%%2056'
+            - '%%2057'
+            - '%%2059'
+            - '%%2060'
+            - '%%2061'
+            - '%%2062'
+            - '%%2063'
+            - '%%2064'
+            - '%%2066'
+            - '%%2081'
+            - '%%2082'
+            - '%%2083'
+            - '%%2085'
+            - '%%2086'
+            - '%%2087'
+            - '%%2088'
+            - '%%2089'
+            - '%%2091'
+            - '%%2092'
+            - '%%2093'
+            - '%%2094'
+            - '%%2095'
+            - '%%2096'
+            - '%%2098'
+    attributes:
+        - AccountExpires|re: '^\s*[^\s-]'
+        - LogonHours|re: '^\s*[^\s-]'
+        - UserWorkstations|re: '^\s*[^\s-]'
+        - ScriptPath|re: '^\s*[^\s-]'
+        - ProfilePath|re: '^\s*[^\s-]'
+        - HomeDirectory|re: '^\s*[^\s-]'
+        - PrimaryGroupId|re: '^\s*[^\s-]'
+        - AllowedToDelegateTo|re: '^\s*[^\s-]'
+        - UserPrincipalName|re: '^\s*[^\s-]'
+        - UserParameters|re: '^\s*[^\s-]'
+    just_created:
+        Evtxa.SinceCreated|lt: 300
+    condition: selection and (flags or attributes) and not just_created
 falsepositives:
-    - Смена пароля, плановое администрирование
-level: low
+    - Плановое администрирование по заявке
+level: medium
 ---
 title: Учетная запись заблокирована
 id: 3ff0dda3-c796-5d3f-a3dd-ffec92e31365
@@ -5214,36 +5364,54 @@ falsepositives:
     - Публичная адресация внутренней сети
 level: high
 ---
-title: Вход с явными учетными данными (runas)
-id: 832e8af5-a050-5486-a71c-3bb2c8935c61
+title: Использованы учетные данные другой учетной записи (runas)
+id: 7ec62c68-86b1-5472-9f4f-140d4c117009
 status: stable
-description: Пользователь запустил программу или подключение от имени другой учетной записи.
+description: Пользователь ввел логин и пароль другой учетной записи (событие 4648) — «Запуск от имени», пароль администратора в окне UAC, runas, подключение сетевого диска или RDP под чужим именем. Значит, ему известен чужой пароль, обычно администратора. Ввод собственных учетных данных (повторное подключение, сохраненный пароль) не считается.
 author: EVTX Audit
-date: 2026-10-14
+date: 2026-10-22
+tags:
+    - attack.privilege-escalation
+    - attack.t1078
 evtxa_group: Входы в систему
 fstec239: [ИАФ, УПД]
 fields:
     - Кто=SubjectUserName
-    - От имени=TargetUserName
-    - Сервер=TargetServerName
+    - Чьи учетные данные=TargetUserName
+    - Домен=TargetDomainName
+    - Куда=TargetServerName
     - Процесс=ProcessName
+    - IP=IpAddress
 logsource:
     product: windows
     service: security
 detection:
     selection:
         EventID: 4648
+    other_account:
+        Evtxa.OtherAccount: '1'
     filter_system:
         SubjectUserSid:
             - 'S-1-5-18'
             - 'S-1-5-19'
             - 'S-1-5-20'
     filter_machine:
-        SubjectUserName|endswith: '$'
-    condition: selection and not filter_system and not filter_machine
+        - SubjectUserName|endswith: '$'
+        - TargetUserName|endswith: '$'
+    filter_virtual:
+        - TargetUserName|startswith:
+              - 'DWM-'
+              - 'UMFD-'
+        - TargetUserName:
+              - 'ANONYMOUS LOGON'
+              - 'SYSTEM'
+              - 'LOCAL SERVICE'
+              - 'NETWORK SERVICE'
+    condition: selection and other_account and not filter_system and not filter_machine and not filter_virtual
 falsepositives:
-    - Подключение сетевых дисков с другими учетными данными, задания с сохраненным паролем
-level: low
+    - Технологическое ПО, подключающееся к серверу под служебной учетной записью (видно по «Процессу»)
+    - Администратор, выполняющий работы по заявке под своей административной УЗ
+level: medium
 ---
 title: Отказ во входе — ограничения УЗ, отключенная или просроченная УЗ
 id: cbe0547e-c72f-5a4e-9e97-f0ff4c30f7d5
@@ -5274,12 +5442,15 @@ detection:
     condition: selection
 level: medium
 ---
-title: Вход с паролем в открытом виде (тип 8)
-id: 68315eb0-d162-549c-8297-a8d1bc839968
+title: Вход с паролем в открытом виде (тип 8) с внешнего адреса
+id: 911768d7-e783-5fbc-a58e-3dfc2efde7d9
 status: stable
-description: Программа или служба получила логин и пароль как есть и проверила их через Windows (NetworkCleartext) — IIS с Basic-аутентификацией, веб-интерфейсы, LDAP simple bind, скрипты с паролем в настройках. По процессу и IP определите источник; пароль, хранящийся или передаваемый открыто, — нарушение.
+description: Тип 8 (NetworkCleartext) — программа получила логин и пароль как есть и проверила их через Windows (веб-интерфейс SCADA, IIS с Basic-аутентификацией, LDAP, скрипт). Внутри сети это обычно штатная работа ПО, поэтому нарушением считается только вход с адреса вне частных диапазонов — веб-интерфейс или служба доступны извне. Все входы типа 8 — на листах «Находки» и «Входы».
 author: EVTX Audit
-date: 2026-10-14
+date: 2026-10-22
+tags:
+    - attack.initial-access
+    - attack.t1133
 evtxa_group: Входы в систему
 fstec239: [ИАФ, ЗИС]
 fields:
@@ -5293,8 +5464,19 @@ detection:
     selection:
         EventID: 4624
         LogonType: 8
-    condition: selection
-level: medium
+        IpAddress|re: '^(::ffff:)?[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+    filter_private:
+        IpAddress|cidr:
+            - '10.0.0.0/8'
+            - '172.16.0.0/12'
+            - '192.168.0.0/16'
+            - '127.0.0.0/8'
+            - '169.254.0.0/16'
+            - '100.64.0.0/10'
+    condition: selection and not filter_private
+falsepositives:
+    - Публичная адресация внутренней сети
+level: high
 ---
 title: Подключен съемный накопитель (USB, SD)
 id: 053f7a36-0d06-5d60-af3f-1da60981e2b1
@@ -6459,28 +6641,6 @@ detection:
     condition: by_text or by_id
 level: medium
 ---
-title: 'Kaspersky: ошибка обновления баз'
-id: aaef0ee2-93a0-5348-bf85-40da6ad2f1f2
-status: experimental
-description: Обновление баз завершилось ошибкой. Единичные ошибки — норма, но если базы давно не обновлялись, защита ослаблена.
-author: EVTX Audit
-date: 2026-10-15
-evtxa_group: Средства защиты
-fstec239: [АВЗ]
-fields:
-    - Событие=Kaspersky.Summary
-    - Причина=Kaspersky.Reason
-    - Результат=Kaspersky.Result
-logsource:
-    product: windows
-detection:
-    by_text:
-        Kaspersky.Event|re: '(?i)(ошибк\w*\s+(\w+\s+)?обновлени|обновлени\w*\s+(\w+\s+)?(не\s+выполнен|заверш\w*\s+с\s+ошибк|прерван)|update\s+(\w+\s+)?(error|failed)|(error|failure)\s+(during|of)\s+(the\s+)?update)'
-    condition: by_text
-falsepositives:
-    - Временная недоступность сервера обновлений
-level: low
----
 title: 'Kaspersky: лицензия истекла или недействительна'
 id: fa9466bd-d9e3-5108-b694-de141b6676ec
 status: experimental
@@ -6646,14 +6806,22 @@ detection:
     condition: selection
 level: medium
 ---
-title: Изменено правило брандмауэра Windows
-id: 2c8bc574-4772-586b-8e73-8849e86a4d07
+title: Правило брандмауэра изменено пользователем
+id: 7c1a1b64-c32e-5d7d-9b81-0ff94e975ed7
 status: stable
-description: Добавлено, изменено или удалено правило брандмауэра.
+description: Правило брандмауэра Windows добавлено, изменено или удалено от имени пользователя — вручную (оснастка «Брандмауэр», netsh, PowerShell, «Разрешить взаимодействие с приложением») или установленной им программой. Изменения от служб Windows, групповой политики, установщика Windows от имени системы и антивируса не считаются — их тысячи, и они не нарушение.
 author: EVTX Audit
-date: 2026-10-14
+date: 2026-10-22
+tags:
+    - attack.defense-evasion
+    - attack.t1562.004
 evtxa_group: Средства защиты
 fstec239: [ЗИС]
+fields:
+    - Правило=RuleName
+    - Программа в правиле=ApplicationPath
+    - Локальные порты=LocalPorts
+    - Кем изменено=ModifyingApplication
 logsource:
     product: windows
     service: firewall-as
@@ -6663,10 +6831,25 @@ detection:
             - 2004
             - 2005
             - 2006
-    condition: selection
+            - 2052
+            - 2097
+            - 2099
+        ModifyingApplication|exists: true
+        ModifyingUser|startswith: 'S-1-5-21-'
+    filter_system_app:
+        ModifyingApplication|endswith:
+            - '\svchost.exe'
+            - '\msiexec.exe'
+            - '\MsMpEng.exe'
+            - '\TiWorker.exe'
+            - '\TrustedInstaller.exe'
+            - '\SecurityHealthService.exe'
+            - '\avp.exe'
+            - '\klnagent.exe'
+    condition: selection and not filter_system_app
 falsepositives:
-    - Установка ПО, групповая политика
-level: low
+    - Настройка брандмауэра администратором по заявке
+level: medium
 ---
 title: Очищен журнал Security
 id: 7bb5e9e6-1679-595a-b536-7d3698f012f4
@@ -7259,7 +7442,9 @@ detection:
             - 'S-1-5-18'
             - 'S-1-5-19'
             - 'S-1-5-20'
-    condition: selection and not filter_system
+    auto_adjust:
+        Evtxa.TimeShiftAbs|lt: 1
+    condition: selection and not filter_system and not auto_adjust
 level: informational
 ---
 title: Ослаблена защита (шаг цепочки)
@@ -10828,11 +11013,32 @@ function Test-V114Rules {
         $l.Add((New-V10Event 'Microsoft-Windows-Kernel-General' 1 '08:04:00' 'System' ([ordered]@{NewTime='2026-03-01T08:04:00.0000000Z';OldTime='2026-03-02T08:04:00.0000000Z';Reason='1';ProcessName='\Device\HarddiskVolume2\Windows\System32\rundll32.exe';ProcessID='4321'}) '0x8000000000000010' 'S-1-5-21-1-2-3-1100'))
         $l.Add((New-V10Event 'Microsoft-Windows-Kernel-General' 1 '08:05:00' 'System' ([ordered]@{NewTime='2026-03-02T08:05:00.0100000Z';OldTime='2026-03-02T08:05:00.0000000Z';Reason='2';ProcessName='\Device\HarddiskVolume2\Windows\System32\svchost.exe';ProcessID='1540'}) '0x8000000000000010' 'S-1-5-19'))
         $l.Add((New-V10Event 'Microsoft-Windows-Kernel-PnP' 400 '08:06:00' 'Microsoft-Windows-Kernel-PnP/Configuration' ([ordered]@{DeviceInstanceId='BTHENUM\{0000110a-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002\7&1A2B3C4D&0&AABBCCDDEEFF_C00000000';DriverName='bth.inf'}) '0x4000000000000000' 'S-1-5-18'))
-        # A program with a cleartext password every 30 s for 3 minutes: 3 rows (one per minute), not one.
+        # v11.6: time — sub-second adjustments by a sync program are not violations, real changes show the shift.
+        $l.Add((New-V10Event 'Microsoft-Windows-Kernel-General' 1 '08:07:00' 'System' ([ordered]@{NewTime='2026-03-02T08:07:00.184000000Z';OldTime='2026-03-02T08:07:00.184356700Z';Reason='1';ProcessName='\Device\HarddiskVolume2\Program Files\SCADA\TimeSync.exe';ProcessID='777'}) '0x8000000000000010' 'S-1-5-21-1-2-3-1100'))
+        $l.Add((New-V10Event $sec 4616 '08:07:00' 'Security' (& $with ([ordered]@{PreviousTime='2026-03-02T08:07:00.184356700Z';NewTime='2026-03-02T08:07:00.184000000Z';ProcessId='0x309';ProcessName='C:\Program Files\SCADA\TimeSync.exe'}))))
+        $l.Add((New-V10Event $sec 4616 '08:08:00' 'Security' (& $with ([ordered]@{PreviousTime='2026-03-02T08:08:00.500000000Z';NewTime='2026-03-02T07:08:00.000000000Z';ProcessId='0x40c';ProcessName='C:\Windows\System32\rundll32.exe'}))))
+        # v11.6: 4648 — another account's credentials (operator types the admin password), not own ones.
+        $op=[ordered]@{SubjectUserSid='S-1-5-21-1-2-3-1100';SubjectUserName='operator';SubjectDomainName='WS01';SubjectLogonId='0x111'}
+        $as={ param($extra) $d=[ordered]@{}; foreach ($k in $op.Keys) { $d[$k]=$op[$k] }; foreach ($k in $extra.Keys) { $d[$k]=$extra[$k] }; $d }
+        $l.Add((New-V10Event $sec 4648 '08:10:00' 'Security' (& $as ([ordered]@{TargetUserName='admin';TargetDomainName='WS01';TargetServerName='localhost';ProcessName='C:\Windows\System32\consent.exe';IpAddress='::1'}))))
+        $l.Add((New-V10Event $sec 4648 '08:11:00' 'Security' (& $as ([ordered]@{TargetUserName='operator@ws01';TargetDomainName='WS01';TargetServerName='SCADA-SRV';ProcessName='C:\Windows\System32\mstsc.exe'}))))
+        # v11.6: 4738 — only meaningful changes; password bookkeeping and a just-created account are skipped.
+        $l.Add((New-V10Event $sec 4738 '08:20:00' 'Security' (& $with ([ordered]@{TargetUserName='operator';TargetDomainName='WS01';TargetSid='S-1-5-21-1-2-3-1100';PasswordLastSet='3/2/2026 8:20:00 AM';AccountExpires='-';LogonHours='-';ScriptPath='-';OldUacValue='0x10';NewUacValue='0x800010';UserAccountControl='%%2097'}))))
+        $l.Add((New-V10Event $sec 4738 '08:21:00' 'Security' (& $with ([ordered]@{TargetUserName='operator';TargetDomainName='WS01';TargetSid='S-1-5-21-1-2-3-1100';PasswordLastSet='-';ScriptPath='\\srv\netlogon\run.bat';LogonHours='%%1797';OldUacValue='0x10';NewUacValue='0x10';UserAccountControl='-'}))))
+        $l.Add((New-V10Event $sec 4720 '08:30:00' 'Security' (& $with ([ordered]@{TargetUserName='shift2';TargetDomainName='WS01';TargetSid='S-1-5-21-1-2-3-1800';SamAccountName='shift2';OldUacValue='0x0';NewUacValue='0x15';UserAccountControl='%%2080 %%2082 %%2084'}))))
+        $l.Add((New-V10Event $sec 4738 '08:30:01' 'Security' (& $with ([ordered]@{TargetUserName='shift2';TargetDomainName='WS01';TargetSid='S-1-5-21-1-2-3-1800';AccountExpires='%%1794';LogonHours='%%1797';OldUacValue='0x15';NewUacValue='0x10';UserAccountControl='%%2048 %%2050'}))))
+        # v11.6: firewall — a user in the console, not group policy or an installer running as SYSTEM.
+        $fw='Microsoft-Windows-Windows Firewall With Advanced Security'; $fwc="$fw/Firewall"
+        $l.Add((New-V10Event $fw 2004 '08:40:00' $fwc ([ordered]@{RuleId='{1}';RuleName='Core Networking - DHCP';ApplicationPath='';LocalPorts='68';ModifyingUser='S-1-5-18';ModifyingApplication='C:\Windows\System32\svchost.exe'}) '0x8000020000000000'))
+        $l.Add((New-V10Event $fw 2004 '08:41:00' $fwc ([ordered]@{RuleId='{2}';RuleName='Radmin 3389';ApplicationPath='';LocalPorts='4899';ModifyingUser='S-1-5-21-1-2-3-1000';ModifyingApplication='C:\Windows\System32\mmc.exe'}) '0x8000020000000000'))
+        $l.Add((New-V10Event $fw 2004 '08:42:00' $fwc ([ordered]@{RuleId='{3}';RuleName='Some App';ApplicationPath='C:\App\a.exe';LocalPorts='*';ModifyingUser='S-1-5-21-1-2-3-1000';ModifyingApplication='C:\Windows\System32\msiexec.exe'}) '0x8000020000000000'))
+        # A web interface checks a password every 30 s from the Internet for 3 minutes: 3 rows (one per minute), not one.
         for ($i=0; $i -lt 7; $i++) {
             $t=[TimeSpan]::FromSeconds(9*3600+30*$i)
-            $l.Add((New-V10Event $sec 4624 ('{0:hh\:mm\:ss}' -f $t) 'Security' ([ordered]@{SubjectUserSid='S-1-5-18';TargetUserSid='S-1-5-21-1-2-3-1700';TargetUserName='svc_hmi';TargetDomainName='WS01';TargetLogonId=('0x'+(700+$i));LogonType='8';LogonProcessName='Advapi  ';AuthenticationPackageName='Negotiate';ProcessName='C:\Windows\System32\inetsrv\w3wp.exe';IpAddress='10.0.0.20';IpPort='50000'})))
+            $l.Add((New-V10Event $sec 4624 ('{0:hh\:mm\:ss}' -f $t) 'Security' ([ordered]@{SubjectUserSid='S-1-5-18';TargetUserSid='S-1-5-21-1-2-3-1700';TargetUserName='svc_hmi';TargetDomainName='WS01';TargetLogonId=('0x'+(700+$i));LogonType='8';LogonProcessName='Advapi  ';AuthenticationPackageName='Negotiate';ProcessName='C:\Windows\System32\inetsrv\w3wp.exe';IpAddress='91.200.1.5';IpPort='50000'})))
         }
+        # The same from the plant network: normal work of the program, a finding but not a violation.
+        $l.Add((New-V10Event $sec 4624 '09:10:00' 'Security' ([ordered]@{SubjectUserSid='S-1-5-18';TargetUserSid='S-1-5-21-1-2-3-1700';TargetUserName='svc_hmi';TargetDomainName='WS01';TargetLogonId='0x800';LogonType='8';LogonProcessName='Advapi  ';AuthenticationPackageName='Negotiate';ProcessName='C:\Windows\System32\inetsrv\w3wp.exe';IpAddress='10.0.0.20';IpPort='50000'})))
         $c=Invoke-V10Engine $dir $evtx $l $sigma
         $vw=New-Writer (Join-Path $dir 'Violations.csv')
         try { [void]$sigma.WriteViolations($vw,[string]$Delimiter) } finally { Close-Writer $vw }
@@ -10844,10 +11050,18 @@ function Test-V114Rules {
         Assert-True ($policy.Count -eq 1 -and $policy[0].'Детали' -like '*Мин. длина: 0*' -and $policy[0].'Пользователь' -eq 'WS01\admin') 'v11.4: password policy changed by a user, not by SYSTEM'
         Assert-True (@(& $row 'Отказ во входе*').Count -eq 1 -and @(& $row 'Отказ во входе*')[0].'Детали' -like '*0xc0000071*') 'v11.4: logon refused, expired password'
         $time=@(& $row 'Системное время изменено программой*')
-        Assert-True ($time.Count -eq 1 -and $time[0].'Детали' -like '*rundll32.exe*' -and $time[0].'Группа' -eq 'Изменение времени') 'v11.4: time change in System by a program, time service ignored'
+        Assert-True ($time.Count -eq 1 -and $time[0].'Детали' -like '*Сдвиг, сек: -86400*rundll32.exe*' -and $time[0].'Группа' -eq 'Изменение времени') 'v11.4: time change in System by a program, time service and sub-second adjustment ignored'
+        $userTime=@(& $row 'Системное время изменено пользователем')
+        Assert-True ($userTime.Count -eq 1 -and $userTime[0].'Детали' -like '*Сдвиг, сек: -3600.5*rundll32.exe*' -and $userTime[0].'Пользователь' -eq 'WS01\admin') 'v11.6: 4616 by a user with the shift; sub-second adjustment by a sync program ignored'
+        $runas=@(& $row 'Использованы учетные данные другой учетной записи*')
+        Assert-True ($runas.Count -eq 1 -and $runas[0].'Уровень' -eq 'Средний' -and $runas[0].'Пользователь' -eq 'WS01\operator' -and $runas[0].'Детали' -like '*Чьи учетные данные: admin*consent.exe*') 'v11.6: 4648 with another account counted, own credentials not'
+        $acct=@(& $row 'Изменены параметры учетной записи')
+        Assert-True ($acct.Count -eq 1 -and $acct[0].'Уровень' -eq 'Средний' -and $acct[0].'Детали' -like '*Часы входа: все часы; Сценарий входа: \\srv\netlogon\run.bat*' -and $acct[0].'Детали' -notlike '*Флаги*') 'v11.6: 4738 only for meaningful changes (not password bookkeeping, not a just-created account)'
+        $fwRows=@(& $row 'Правило брандмауэра изменено пользователем')
+        Assert-True ($fwRows.Count -eq 1 -and $fwRows[0].'Детали' -like 'Правило: Radmin 3389*mmc.exe*' -and $fwRows[0].'Пользователь' -like 'WS01\admin*') 'v11.6: firewall rule changed by a user, not by group policy or an installer'
         Assert-True (@(& $row 'Подключено Bluetooth-устройство').Count -eq 1) 'v11.4: Bluetooth device'
-        $clear=@(& $row 'Вход с паролем в открытом виде (тип 8)')
-        Assert-True ($clear.Count -eq 3 -and $clear[0].'Уровень' -eq 'Средний' -and $clear[0].'Повторов' -eq '3' -and (@($clear | ForEach-Object { [int]$_.'Повторов' }) | Measure-Object -Sum).Sum -eq 7 -and $clear[0].'Детали' -like '*w3wp.exe*') 'v11.4: cleartext logons, rows merged only within a minute of the first event'
+        $clear=@(& $row 'Вход с паролем в открытом виде (тип 8)*')
+        Assert-True ($clear.Count -eq 3 -and $clear[0].'Уровень' -eq 'Высокий' -and $clear[0].'Повторов' -eq '3' -and (@($clear | ForEach-Object { [int]$_.'Повторов' }) | Measure-Object -Sum).Sum -eq 7 -and $clear[0].'Детали' -like '*91.200.1.5*w3wp.exe*') 'v11.6: cleartext logons from outside only; rows merged only within a minute of the first event'
         # AV logs read whole: only real detections are findings, not every event that names the product.
         $nl="`r`n"; $script:V10Rid=0
         $avCases=@(
@@ -10871,7 +11085,7 @@ function Test-V114Rules {
             Assert-True ($null -eq $engine.Match($engine.Parse((New-V10Event 'KES' 1 '10:00:00' 'Kaspersky Event Log' @('Тип события: Обнаружен вредоносный объект') '0x80000000000000')))) 'v11.5 AV heuristic: Kaspersky events are left to the Kaspersky rules'
         } finally { $engine.Dispose() }
         $findings=@(Import-Csv -LiteralPath (Join-Path $dir 'Findings-0001.csv') -Delimiter $Delimiter -Encoding UTF8 | Where-Object { $_.'Event ID' -eq '4624' })
-        Assert-True ($findings.Count -eq 7 -and @($findings | Where-Object { $_.'Событие' -eq 'Вход с паролем в открытом виде (тип 8)' }).Count -eq 7) 'v11.4: every cleartext logon is a finding'
+        Assert-True ($findings.Count -eq 8 -and @($findings | Where-Object { $_.'Событие' -eq 'Вход с паролем в открытом виде (тип 8)' }).Count -eq 8) 'v11.4: every cleartext logon is a finding'
     } finally {
         foreach ($k in $saved.Keys) { Set-Variable -Scope Script -Name $k -Value $saved[$k] }
         foreach ($w in @($script:Writers)) { try { $w.Dispose() } catch { } }
